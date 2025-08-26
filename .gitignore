@@ -1,0 +1,17 @@
+# Ignore Airflow logs
+logs/
+
+# Ignore Python cache files in dags/
+dags/__pycache__/
+dags/**/*.pyc
+dags/**/*.pyo
+dags/**/*.pyd
+
+# Ignore secrets/var.json
+secrets/var.json
+
+# General Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
