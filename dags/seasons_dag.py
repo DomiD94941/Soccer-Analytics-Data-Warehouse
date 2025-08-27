@@ -58,14 +58,23 @@ def seasons_dag():
         """
         Validate that seasons exist in the API response.
         """
-        
+        from airflow.exceptions import AirflowSkipException
+
         log = LoggingMixin().log
-        available_seasons = seasons.get("seasons", [])
+        available_seasons = []
         if not available_seasons:
             log.warning("No seasons found in API response.")
-            return []  # or raise AirflowException if this should fail the DAG
+            raise AirflowSkipException("No seasons found in API response.")
         
         log.info("Found %d seasons", len(available_seasons))
         return available_seasons
-       
+
+    @task
+    def extract_seasons(available_seasons: list[int]) -> list[dict[str, int]]:
+        """
+        Transform raw API payload to table-shaped dicts with column names
+        matching the SEASONS table schema.
+        """
+        return [{"SEASON_YEAR": int(season)} for season in available_seasons]
     
+
