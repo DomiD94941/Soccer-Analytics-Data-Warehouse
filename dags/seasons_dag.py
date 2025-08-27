@@ -53,5 +53,19 @@ def seasons_dag():
         
         return PokeReturnValue(is_done=True, xcom_value=payload)
     
-   
+    @task
+    def are_seasons_exist(seasons: dict) -> list:
+        """
+        Validate that seasons exist in the API response.
+        """
+        
+        log = LoggingMixin().log
+        available_seasons = seasons.get("seasons", [])
+        if not available_seasons:
+            log.warning("No seasons found in API response.")
+            return []  # or raise AirflowException if this should fail the DAG
+        
+        log.info("Found %d seasons", len(available_seasons))
+        return available_seasons
+       
     
