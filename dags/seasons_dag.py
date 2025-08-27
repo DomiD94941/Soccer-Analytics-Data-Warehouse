@@ -1,4 +1,6 @@
-from airflow.sdk import dag, task
+from airflow.sdk import dag, task, Variable
+from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.sensors.base import PokeReturnValue
 
 @dag
 def seasons_dag():
@@ -8,6 +10,7 @@ def seasons_dag():
         """
         Create SEASONS table if it does not exist.
         """
+
         return """
         DECLARE
           e_exists EXCEPTION;
@@ -22,3 +25,33 @@ def seasons_dag():
           WHEN e_exists THEN NULL;
         END;
         """
+
+    @task.sensor(poke_interval=30, timeout=120)
+    def is_api_available() -> PokeReturnValue:
+        """
+        Check if the API is available.
+        """
+        import requests
+
+        log = LoggingMixin().log
+
+        api_key = Variable.get("API_KEY")
+        url = "https://v3.football.api-sports.io/leagues/seasons"
+        headers = {
+            "x-rapidapi-host": "v3.football.api-sports.io",
+            "x-rapidapi-key": api_key   
+        }
+        
+        try:
+            response = requests.get(url, headers=headers)
+            log.info("API response status: %s", response.status_code)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as e:
+            log.warning("API not available yet: %s", e)
+            return PokeReturnValue(is_done=False, xcom_value=None)
+        
+        return PokeReturnValue(is_done=True, xcom_value=payload)
+    
+   
+    
