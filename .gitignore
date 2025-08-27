@@ -7,6 +7,9 @@ dags/**/*.pyc
 dags/**/*.pyo
 dags/**/*.pyd
 
+# Ignore test files
+dags/test*.py
+
 # Ignore secrets/var.json
 secrets/var.json
 
