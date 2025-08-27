@@ -1,4 +1,4 @@
-from airflow.sdk import dag, task, Variable
+from airflow.sdk import dag, task, task_group, Variable
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.sensors.base import PokeReturnValue
 
@@ -70,7 +70,7 @@ def seasons_dag():
         return available_seasons
 
     @task
-    def extract_seasons(available_seasons: list[int]) -> list[dict[str, int]]:
+    def format_seasons(available_seasons: list[int]) -> list[dict[str, int]]:
         """
         Transform raw API payload to table-shaped dicts with column names
         matching the SEASONS table schema.
