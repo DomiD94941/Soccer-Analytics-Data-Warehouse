@@ -1,6 +1,7 @@
 from airflow.sdk import dag, task, task_group, Variable
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.sensors.base import PokeReturnValue
+from airflow.providers.oracle.hooks.oracle import OracleHook
 
 @dag
 def seasons_dag():
@@ -61,7 +62,7 @@ def seasons_dag():
         from airflow.exceptions import AirflowSkipException
 
         log = LoggingMixin().log
-        available_seasons = []
+        available_seasons = seasons.get("response", [])
         if not available_seasons:
             log.warning("No seasons found in API response.")
             raise AirflowSkipException("No seasons found in API response.")
@@ -75,6 +76,90 @@ def seasons_dag():
         Transform raw API payload to table-shaped dicts with column names
         matching the SEASONS table schema.
         """
-        return [{"SEASON_YEAR": int(season)} for season in available_seasons]
+        return [{"SEASON_ID": i, "SEASON_YEAR": season_year} for i, season_year in enumerate(available_seasons, start=1)]
     
+    @task_group
+    def load_seasons(formatted_seasons: list[dict[str, int]]):
+        @task
+        def load_seasons_csv(formatted_seasons: list[dict[str, int]]) -> str:
+            """
+            Append-only CSV writer for SEASONS:
+            - Reads existing SEASON_IDs (if file exists)
+            - Appends only NEW rows (skips IDs already present; also dedupes within batch)
+            - Writes header once when the file is empty/new
+            """
+            import os
+            import csv
+
+            path = "/tmp/seasons.csv"
+
+            fieldnames = list(formatted_seasons[0].keys())
+
+            existing_ids = set()
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                with open(path, newline="", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        existing_ids.add(str(row.get("SEASON_ID", "")).strip())
+
+            seen_batch = set()
+            new_rows = []
+            for row in formatted_seasons:
+                season_id = str(row.get("SEASON_ID", "")).strip()
+                if not season_id or season_id in existing_ids or season_id in seen_batch:
+                    continue
+                seen_batch.add(season_id)
+                new_rows.append(row)
+
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                if f.tell() == 0:
+                    w.writeheader()
+                if new_rows:
+                    w.writerows(new_rows)
+
+            return f"Appended {len(new_rows)} new seasons to {path}"
+
+        @task
+        def load_seasons_oracle_db(formatted_seasons: list[dict[str, int]]) -> str:
+            """
+            Insert-only load into Oracle (skip if SEASON_ID already exists):
+            - Uses MERGE with only WHEN NOT MATCHED (no update clause)
+            - Works idempotently across multiple DAG runs
+            - executemany with named binds for efficiency
+            """
+
+            sql = """
+                MERGE INTO SEASONS t
+                USING (
+                    SELECT
+                        :SEASON_ID AS SEASON_ID,
+                        :SEASON_YEAR AS SEASON_YEAR
+                    FROM dual
+                ) s
+                ON (t.SEASON_ID = s.SEASON_ID)
+                WHEN NOT MATCHED THEN INSERT (
+                    SEASON_ID, SEASON_YEAR
+                ) VALUES (
+                    s.SEASON_ID, s.SEASON_YEAR
+                )
+            """
+
+            hook = OracleHook(oracle_conn_id="oracle_default")
+            with hook.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.executemany(sql, formatted_seasons)
+                    inserted = cur.rowcount or 0
+                conn.commit()
+
+            return f"Inserted {inserted} new seasons into the database."
+
+        load_seasons_csv(formatted_seasons) >> load_seasons_oracle_db(formatted_seasons)
+
+    create_seasons_table() 
+    seasons = is_api_available()
+    available_seasons = are_seasons_exist(seasons)
+    formatted_seasons = format_seasons(available_seasons)
+    load_seasons(formatted_seasons)
+
+seasons_dag()
 
