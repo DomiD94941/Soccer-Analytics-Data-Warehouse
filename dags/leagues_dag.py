@@ -2,13 +2,11 @@ from airflow.sdk import dag, task, task_group, Variable
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.sensors.base import PokeReturnValue
 from airflow.providers.oracle.hooks.oracle import OracleHook
+from airflow.utils.trigger_rule import TriggerRule
 
 @dag
 def leagues_dag():
 
-    # ------------------------------
-    # DDL (matches exactly your table)
-    # ------------------------------
     @task.sql(conn_id="oracle_default")
     def create_leagues_table():
         return """
@@ -62,8 +60,11 @@ def leagues_dag():
         }
 
     @task.sensor(poke_interval=30, timeout=120)
-    def is_api_available(country_name: str) -> PokeReturnValue:
+    def is_api_available(selection: dict) -> PokeReturnValue:
         import requests
+
+        country_name = selection["country_name"]
+
         log = LoggingMixin().log
         api_key = Variable.get("API_KEY")
         url = "https://v3.football.api-sports.io/leagues"
@@ -84,26 +85,29 @@ def leagues_dag():
             return PokeReturnValue(is_done=False, xcom_value=None)
         return PokeReturnValue(is_done=True, xcom_value=payload)
     
-    @task
-    def are_leagues_exist(payload: dict) -> list[dict]:
+    @task.branch
+    def are_leagues_exist(payload: dict, **context):
         """
         Validate that leagues exist in the API response.
         """
-        from airflow.exceptions import AirflowSkipException
         log = LoggingMixin().log
-        available_leagues = payload.get("response", []) or []
+        available_leagues = payload.get("response", [])
         if not available_leagues:
             log.warning("No leagues found in API response.")
-            raise AirflowSkipException("No leagues found in API response.")
+            return "update_leagues_country"
         log.info("Found %d leagues", len(available_leagues))
-        return available_leagues
+        context['ti'].xcom_push(key='available_leagues', value=available_leagues)
+        return "format_leagues"
 
     @task
-    def format_leagues(available_leagues: list[dict], country_id: int) -> list[dict]:
+    def format_leagues(selection, **context) -> list[dict]:
         """
         Build rows for LEAGUES from the API response for the selected country.
         Keeps only LEAGUE_ID, LEAGUE_NAME, LEAGUE_TYPE, COUNTRY_ID.
         """
+
+        country_id = selection["country_id"]
+        available_leagues = context['ti'].xcom_pull(key='available_leagues', task_ids='are_leagues_exist')
 
         formatted_leagues: list[dict] = []
         for leagues in available_leagues:
@@ -119,16 +123,18 @@ def leagues_dag():
                 "COUNTRY_ID": country_id,
             })
 
-        return formatted_leagues
+        context['ti'].xcom_push(key='formatted_leagues', value=formatted_leagues)
     
     @task_group
-    def load_leagues(formatted_leagues: list[dict]):
+    def load_leagues():
         @task
-        def leagues_to_csv(formatted_leagues: list[dict]) -> str:
+        def leagues_to_csv(**context) -> str:
             """
             Append-only CSV with final schema.
             """
             import os, csv
+
+            formatted_leagues = context['ti'].xcom_pull(key='formatted_leagues', task_ids='format_leagues')
             path = "/tmp/leagues.csv"
 
             fieldnames = ["LEAGUE_ID", "LEAGUE_NAME", "LEAGUE_TYPE", "COUNTRY_ID"]
@@ -157,35 +163,62 @@ def leagues_dag():
             return f"Appended {len(new_rows)} leagues to {path}"
 
         @task
-        def leagues_to_oracle(formatted_leagues: list[dict]) -> str:
+        def leagues_to_oracle(**context) -> str:
             """
             Insert-only MERGE into LEAGUES (idempotent).
             """
+            
+            formatted_leagues = context['ti'].xcom_pull(key='formatted_leagues', task_ids='format_leagues')
+            rows = [(r["LEAGUE_ID"], r["LEAGUE_NAME"], r["LEAGUE_TYPE"], r["COUNTRY_ID"]) for r in formatted_leagues]
+
             sql = """
-                MERGE INTO LEAGUES t
-                USING (
-                    SELECT
-                        :LEAGUE_ID   AS LEAGUE_ID,
-                        :LEAGUE_NAME AS LEAGUE_NAME,
-                        :LEAGUE_TYPE AS LEAGUE_TYPE,
-                        :COUNTRY_ID  AS COUNTRY_ID
-                    FROM dual
-                ) s
-                ON (t.LEAGUE_ID = s.LEAGUE_ID)
-                WHEN NOT MATCHED THEN INSERT (
-                    LEAGUE_ID, LEAGUE_NAME, LEAGUE_TYPE, COUNTRY_ID
-                ) VALUES (
-                    s.LEAGUE_ID, s.LEAGUE_NAME, s.LEAGUE_TYPE, s.COUNTRY_ID
-                )
+            MERGE INTO LEAGUES t
+            USING (
+                SELECT
+                    :1 AS LEAGUE_ID,
+                    :2 AS LEAGUE_NAME,
+                    :3 AS LEAGUE_TYPE,
+                    :4 AS COUNTRY_ID
+                FROM dual
+            ) s
+            ON (t.LEAGUE_ID = s.LEAGUE_ID)
+            WHEN NOT MATCHED THEN INSERT (
+                LEAGUE_ID, LEAGUE_NAME, LEAGUE_TYPE, COUNTRY_ID
+            ) VALUES (
+                s.LEAGUE_ID, s.LEAGUE_NAME, s.LEAGUE_TYPE, s.COUNTRY_ID
+            )
             """
+
             hook = OracleHook(oracle_conn_id="oracle_default")
             with hook.get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.executemany(sql, formatted_leagues)
+                    cur.executemany(sql, rows)
                     inserted = cur.rowcount or 0
                 conn.commit()
             return f"Inserted {inserted} new leagues."
 
-        leagues_to_csv(formatted_leagues) >> leagues_to_oracle(formatted_leagues)
+        leagues_to_csv() >> leagues_to_oracle()
+
+    @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
+    def update_leagues_country(selection: dict) -> None:
+        """
+        Advance index only after successful load.
+        """
+        key = selection["key"]
+        idx = selection["idx"]
+        total = selection["total"]
+        next_idx = idx + 1
+        if next_idx >= total:
+            next_idx = total
+        Variable.set(key, str(next_idx))
+    
+    create_leagues_table() 
+    countries = fetch_countries()
+    selection = select_leagues_country(countries)
+    payload = is_api_available(selection)
+    update = update_leagues_country(selection)
+    branch = are_leagues_exist(payload)
+    branch >> format_leagues(selection) >> load_leagues() >> update
+    branch >> update
 
 leagues_dag()
