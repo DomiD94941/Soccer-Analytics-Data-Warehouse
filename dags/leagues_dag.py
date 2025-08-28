@@ -29,3 +29,18 @@ def leagues_dag():
           WHEN e_exists THEN NULL;
         END;
         """
+    
+    @task
+    def get_countries_from_db() -> list[dict[str, str | int | None]]:
+        """
+        Load all countries from Oracle COUNTRIES table.
+        Returns list of dicts: {COUNTRY_ID, COUNTRY_NAME, COUNTRY_CODE}
+        """
+        hook = OracleHook(oracle_conn_id="oracle_default")
+        with hook.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNTRY_ID, COUNTRY_NAME, COUNTRY_CODE FROM COUNTRIES")
+                rows = cur.fetchall()
+        return [{"COUNTRY_ID": row[0], "COUNTRY_NAME": row[1], "COUNTRY_CODE": row[2]} for row in rows]
+    
+
