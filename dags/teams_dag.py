@@ -37,4 +37,22 @@ def teams_dag():
                 cur.execute("SELECT SEASON_ID, SEASON_YEAR FROM SEASONS ORDER BY SEASON_YEAR")
                 seasons = cur.fetchall()
         return [{"SEASON_ID": r[0], "SEASON_YEAR": r[1]} for r in seasons]
+    
+    @task
+    def fetch_leagues_for_season(season_selection: dict) -> list[dict[str, int | str]]:
+        """
+        Inner domain for the selected season: all leagues recorded for that SEASON_ID.
+        """
+        season_id = season_selection["season_id"]
+        hook = OracleHook(oracle_conn_id="oracle_default")
+        with hook.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT LEAGUE_ID, LEAGUE_NAME
+                    FROM LEAGUES
+                    WHERE SEASON_ID = :sid
+                    ORDER BY LEAGUE_ID
+                """, [season_id])
+                leagues = cur.fetchall()
+        return [{"LEAGUE_ID": r[0], "LEAGUE_NAME": r[1]} for r in leagues]
 teams_dag()
