@@ -39,6 +39,24 @@ def teams_dag():
         return [{"SEASON_ID": r[0], "SEASON_YEAR": r[1]} for r in seasons]
     
     @task
+    def select_teams_season(seasons: list[dict[str, int]]) -> dict[str, int]:
+        """
+        Outer pointer: seasons
+        """
+        key = "teams_season_idx"
+        idx = int(Variable.get(key, default=0))
+        total = len(seasons)
+        if idx >= total:
+            idx = 0
+        return {
+            "key": key,
+            "season_id": seasons[idx]["SEASON_ID"],
+            "season_year": seasons[idx]["SEASON_YEAR"],
+            "idx": idx,
+            "total": total
+        }
+    
+    @task
     def fetch_leagues_for_season(season_selection: dict) -> list[dict[str, int | str]]:
         """
         Inner domain for the selected season: all leagues recorded for that SEASON_ID.
@@ -55,4 +73,25 @@ def teams_dag():
                 """, [season_id])
                 leagues = cur.fetchall()
         return [{"LEAGUE_ID": r[0], "LEAGUE_NAME": r[1]} for r in leagues]
+    
+    @task
+    def select_teams_league(leagues: list[dict[str, int | str]]) -> dict[str, int | str]:
+        """
+        Inner pointer: leagues (for the current season).
+        """
+        key = "teams_league_idx"
+        idx = int(Variable.get(key, default=0))
+        total = len(leagues)
+        if total == 0:
+            # No leagues for this season; return an empty selection but keep the pointer info.
+            return {"key": key, "idx": 0, "total": 0}
+        if idx >= total:
+            idx = 0
+        return {
+            "key": key,
+            "league_id": leagues[idx]["LEAGUE_ID"],
+            "league_name": leagues[idx]["LEAGUE_NAME"],
+            "idx": idx,
+            "total": total
+        }
 teams_dag()
