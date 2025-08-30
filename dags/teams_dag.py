@@ -94,4 +94,32 @@ def teams_dag():
             "idx": idx,
             "total": total
         }
+    
+    @task.sensor(poke_interval=30, timeout=120)
+    def is_api_available(season_selection: dict, league_selection: dict) -> PokeReturnValue:
+        import requests
+        log = LoggingMixin().log
+
+        api_key = Variable.get("API_KEY")
+        url = "https://v3.football.api-sports.io/teams"
+        headers = {
+            "x-rapidapi-host": "v3.football.api-sports.io",
+            "x-rapidapi-key": api_key
+        }
+        params = {
+            "league": league_selection["league_id"],
+            "season": season_selection["season_year"]
+        }
+
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+            log.info("API /teams status: %s (league=%s, season=%s)", r.status_code, league_selection.get("league_id"), season_selection.get("season_year"))
+            r.raise_for_status()
+            payload = r.json()
+        except requests.RequestException as e:
+            log.warning("API not available yet: %s", e)
+            return PokeReturnValue(is_done=False, xcom_value=None)
+
+        return PokeReturnValue(is_done=True, xcom_value=payload)
+
 teams_dag()
