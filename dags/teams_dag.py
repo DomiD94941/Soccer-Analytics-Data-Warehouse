@@ -29,5 +29,12 @@ def teams_dag():
           WHEN e_exists THEN NULL;
         END;
         """
-    
+    @task
+    def fetch_seasons() -> list[dict[str, int]]:
+        hook = OracleHook(oracle_conn_id="oracle_default")
+        with hook.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT SEASON_ID, SEASON_YEAR FROM SEASONS ORDER BY SEASON_YEAR")
+                seasons = cur.fetchall()
+        return [{"SEASON_ID": r[0], "SEASON_YEAR": r[1]} for r in seasons]
 teams_dag()
