@@ -21,8 +21,14 @@ def teams_dag():
               TEAM_CODE      VARCHAR2(20),
               TEAM_COUNTRY   VARCHAR2(100),
               FOUNDED        NUMBER,
-              NATIONAL       NUMBER(1),         -- 0/1
+              NATIONAL       VARCHAR2(1),         -- T/F
               VENUE_ID       NUMBER,
+              LEAGUE_ID      NUMBER,
+              SEASON_ID      NUMBER,
+              CONSTRAINT FK_TEAMS_LEAGUE
+                FOREIGN KEY (LEAGUE_ID) REFERENCES LEAGUES(LEAGUE_ID),
+              CONSTRAINT FK_TEAMS_SEASON
+                FOREIGN KEY (SEASON_ID) REFERENCES SEASONS(SEASON_ID),
               CONSTRAINT FK_TEAMS_VENUE
                 FOREIGN KEY (VENUE_ID) REFERENCES VENUES(VENUE_ID)
             )';
@@ -44,13 +50,13 @@ def teams_dag():
         """
         Outer pointer: seasons
         """
-        key = "teams_season_idx"
-        idx = int(Variable.get(key, default=0))
+        season_id_indicator = "teams_season_id_indicator"
+        idx = int(Variable.get(season_id_indicator, default=0))
         total = len(seasons)
         if idx >= total:
             idx = 0
         return {
-            "key": key,
+            "key": season_id_indicator,
             "season_id": seasons[idx]["SEASON_ID"],
             "season_year": seasons[idx]["SEASON_YEAR"],
             "idx": idx,
@@ -74,16 +80,16 @@ def teams_dag():
         """
         Inner pointer: leagues (for the current season).
         """
-        key = "teams_league_idx"
-        idx = int(Variable.get(key, default=0))
+        league_id_indicator = "teams_league_id_indicator"
+        idx = int(Variable.get(league_id_indicator, default=0))
         total = len(leagues)
         if total == 0:
             # No leagues for this season; return an empty selection but keep the pointer info.
-            return {"key": key, "idx": 0, "total": 0}
+            return {"key": league_id_indicator, "idx": 0, "total": 0}
         if idx >= total:
             idx = 0
         return {
-            "key": key,
+            "key": league_id_indicator,
             "league_id": leagues[idx]["LEAGUE_ID"],
             "league_name": leagues[idx]["LEAGUE_NAME"],
             "idx": idx,
@@ -129,24 +135,27 @@ def teams_dag():
         return "format_teams"
 
     @task
-    def format_teams(**context) -> list[dict]:
+    def format_teams(league_selection: dict, season_selection: dict, **context) -> list[dict]:
         """
         Build rows for TEAMS:
         TEAM_ID, TEAM_NAME, TEAM_CODE, TEAM_COUNTRY, FOUNDED, NATIONAL, VENUE_ID
         """
         available_teams = context['ti'].xcom_pull(key='available_teams', task_ids='are_teams_exist')
-
+        league_id = league_selection["league_id"]
+        season_id = season_selection["season_id"]
         formatted: list[dict] = []
         for entry in available_teams:
-            t = (entry.get("team") or {})
-            v = (entry.get("venue") or {})
+            t = entry.get("team")
+            v = entry.get("venue")
             formatted.append({
                 "TEAM_ID": t.get("id"),
                 "TEAM_NAME": t.get("name"),
                 "TEAM_CODE": t.get("code"),
                 "TEAM_COUNTRY": t.get("country"),
                 "FOUNDED": t.get("founded"),
-                "NATIONAL": 1 if t.get("national") else 0,
+                "NATIONAL": "T" if t.get("national") else "F",
+                "LEAGUE_ID": league_id,
+                "SEASON_ID": season_id,
                 "VENUE_ID": v.get("id")
             })
         context['ti'].xcom_push(key='formatted_teams', value=formatted)
@@ -158,7 +167,7 @@ def teams_dag():
             import os, csv
             rows = context['ti'].xcom_pull(key='formatted_teams', task_ids='format_teams')
             path = "/tmp/teams.csv"
-            fieldnames = ["TEAM_ID","TEAM_NAME","TEAM_CODE","TEAM_COUNTRY","FOUNDED","NATIONAL","VENUE_ID"]
+            fieldnames = ["TEAM_ID","TEAM_NAME","TEAM_CODE","TEAM_COUNTRY","FOUNDED","NATIONAL", "LEAGUE_ID", "SEASON_ID", "VENUE_ID"]
 
             existing = set()
             if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -186,8 +195,7 @@ def teams_dag():
         def teams_to_oracle(**context) -> str:
             rows = context['ti'].xcom_pull(key='formatted_teams', task_ids='format_teams') or []
             rows = [
-                (r["TEAM_ID"], r["TEAM_NAME"], r["TEAM_CODE"], r["TEAM_COUNTRY"],
-                 r["FOUNDED"], r["NATIONAL"], r["VENUE_ID"])
+                (r["TEAM_ID"], r["TEAM_NAME"], r["TEAM_CODE"], r["TEAM_COUNTRY"], r["FOUNDED"], r["NATIONAL"], r["LEAGUE_ID"], r["SEASON_ID"], r["VENUE_ID"])
                 for r in rows if r.get("TEAM_ID") is not None
             ]
             if not rows:
@@ -202,14 +210,16 @@ def teams_dag():
                      :4 AS TEAM_COUNTRY,
                      :5 AS FOUNDED,
                      :6 AS NATIONAL,
-                     :7 AS VENUE_ID
+                     :7 AS LEAGUE_ID,
+                     :8 AS SEASON_ID,
+                     :9 AS VENUE_ID
               FROM dual
             ) s
             ON (t.TEAM_ID = s.TEAM_ID)
             WHEN NOT MATCHED THEN INSERT (
-              TEAM_ID, TEAM_NAME, TEAM_CODE, TEAM_COUNTRY, FOUNDED, NATIONAL, VENUE_ID
+              TEAM_ID, TEAM_NAME, TEAM_CODE, TEAM_COUNTRY, FOUNDED, NATIONAL, LEAGUE_ID, SEASON_ID, VENUE_ID
             ) VALUES (
-              s.TEAM_ID, s.TEAM_NAME, s.TEAM_CODE, s.TEAM_COUNTRY, s.FOUNDED, s.NATIONAL, s.VENUE_ID
+              s.TEAM_ID, s.TEAM_NAME, s.TEAM_CODE, s.TEAM_COUNTRY, s.FOUNDED, s.NATIONAL, s.LEAGUE_ID, s.SEASON_ID, s.VENUE_ID
             )
             """
 
@@ -220,6 +230,7 @@ def teams_dag():
                     inserted = cur.rowcount or 0
                 conn.commit()
             return f"Inserted {inserted} new teams."
+        
         teams_to_csv() >> teams_to_oracle()
 
     @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
@@ -243,14 +254,14 @@ def teams_dag():
     # DAG wiring
     create_teams_table()
 
-    country_selection = select_teams_league(fetch_leagues())
+    league_selection = select_teams_league(fetch_leagues())
     season_selection = select_teams_season(fetch_seasons())
 
-    payload = is_api_available(league_selection=country_selection, season_selection=season_selection)
-    update = advance_pointers(league_selection=country_selection, season_selection=season_selection)
+    payload = is_api_available(league_selection=league_selection, season_selection=season_selection)
+    update = advance_pointers(league_selection=league_selection, season_selection=season_selection)
     branch = are_teams_exist(payload)
 
-    branch >> format_teams() >> load_teams() >> update
+    branch >> format_teams(league_selection=league_selection, season_selection=season_selection) >> load_teams() >> update
     branch >> update
 
 
