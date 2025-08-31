@@ -55,29 +55,61 @@ def seasons_dag():
         return PokeReturnValue(is_done=True, xcom_value=payload)
     
     @task
-    def are_seasons_exist(seasons: dict) -> list:
+    def are_seasons_exist(payload: dict) -> list:
         """
         Validate that seasons exist in the API response.
         """
         from airflow.exceptions import AirflowSkipException
 
         log = LoggingMixin().log
-        available_seasons = seasons.get("response", [])
+        available_seasons = payload.get("response", [])
         if not available_seasons:
             log.warning("No seasons found in API response.")
             raise AirflowSkipException("No seasons found in API response.")
         
         log.info("Found %d seasons", len(available_seasons))
         return available_seasons
+    
+    @task.branch
+    def choose_plan() -> str:
+        """
+        Decide which downstream task to run.
+        """
+        import requests
+        log = LoggingMixin().log
+        api_key = Variable.get("API_KEY")
+        headers = {
+            "x-rapidapi-host": "v3.football.api-sports.io",
+            "x-rapidapi-key": api_key   
+        }
+        try:
+            r = requests.get(f"{api_key}/status", headers=headers, timeout=15)
+            r.raise_for_status()
+            plan = r.json()["response"]["subscription"]["plan"]
+        except Exception as exc:
+            log.warning("Failed to get subscription plan: %s", exc)
+            return format_seasons_free_plan.__name__
+
+        if str(plan).lower() == "free":
+            return format_seasons_free_plan.__name__
+        else:
+            return format_seasons_paid_plan.__name__
+        
+    @task
+    def format_seasons_free_plan() -> list[dict[str, int]]:
+        """
+        Free plan: ignore API seasons and return fixed years.
+        """
+        fixed = [2021, 2022, 2023]
+        return [{"SEASON_ID": i, "SEASON_YEAR": year} for i, year in enumerate(fixed, start=1)]
 
     @task
-    def format_seasons(available_seasons: list[int]) -> list[dict[str, int]]:
+    def format_seasons_paid_plan(available_seasons: list[int]) -> list[dict[str, int]]:
         """
-        Transform raw API payload to table-shaped dicts with column names
-        matching the SEASONS table schema.
+        Paid plan: map seasons into SEASONS-table-shaped dicts.
         """
-        return [{"SEASON_ID": i, "SEASON_YEAR": season_year} for i, season_year in enumerate(available_seasons, start=1)]
-    
+        return [{"SEASON_ID": i, "SEASON_YEAR": year} for i, year in enumerate(available_seasons, start=1)]
+
     @task_group
     def load_seasons(formatted_seasons: list[dict[str, int]]):
         @task
@@ -158,8 +190,9 @@ def seasons_dag():
     create_seasons_table() 
     seasons = is_api_available()
     available_seasons = are_seasons_exist(seasons)
-    formatted_seasons = format_seasons(available_seasons)
-    load_seasons(formatted_seasons)
+    branch = choose_plan()
+    branch >> load_seasons(format_seasons_free_plan())
+    branch >> load_seasons(format_seasons_paid_plan(available_seasons))
 
 seasons_dag()
 
