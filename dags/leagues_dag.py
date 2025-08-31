@@ -22,9 +22,7 @@ def leagues_dag():
               COUNTRY_ID  NUMBER,
               SEASON_ID   NUMBER,
               CONSTRAINT FK_LEAGUES_COUNTRY
-                FOREIGN KEY (COUNTRY_ID) REFERENCES COUNTRIES(COUNTRY_ID),
-              CONSTRAINT FK_LEAGUES_SEASON
-                FOREIGN KEY (SEASON_ID) REFERENCES SEASONS(SEASON_ID)
+                FOREIGN KEY (COUNTRY_ID) REFERENCES COUNTRIES(COUNTRY_ID)
             )';
         EXCEPTION WHEN e_exists THEN NULL;
         END;
@@ -162,8 +160,7 @@ def leagues_dag():
                 "LEAGUE_ID": league_id,
                 "LEAGUE_NAME": league_name,
                 "LEAGUE_TYPE": league_type,
-                "COUNTRY_ID": country_id,
-                "SEASON_ID": season_id
+                "COUNTRY_ID": country_id
             })
 
             # seasons array from API; pick the one for target_year
@@ -187,7 +184,7 @@ def leagues_dag():
             import os, csv
             rows = context['ti'].xcom_pull(key='formatted_leagues', task_ids='format_leagues')
             path = "/tmp/leagues.csv"
-            fieldnames = ["LEAGUE_ID", "LEAGUE_NAME", "LEAGUE_TYPE", "COUNTRY_ID", "SEASON_ID"]
+            fieldnames = ["LEAGUE_ID", "LEAGUE_NAME", "LEAGUE_TYPE", "COUNTRY_ID"]
 
             existing_ids = set()
             if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -222,15 +219,14 @@ def leagues_dag():
               SELECT :1 AS LEAGUE_ID,
                      :2 AS LEAGUE_NAME,
                      :3 AS LEAGUE_TYPE,
-                     :4 AS COUNTRY_ID,
-                     :5 AS SEASON_ID
+                     :4 AS COUNTRY_ID
               FROM dual
             ) s
             ON (t.LEAGUE_ID = s.LEAGUE_ID)
             WHEN NOT MATCHED THEN INSERT (
-              LEAGUE_ID, LEAGUE_NAME, LEAGUE_TYPE, COUNTRY_ID, SEASON_ID
+              LEAGUE_ID, LEAGUE_NAME, LEAGUE_TYPE, COUNTRY_ID
             ) VALUES (
-              s.LEAGUE_ID, s.LEAGUE_NAME, s.LEAGUE_TYPE, s.COUNTRY_ID, s.SEASON_ID
+              s.LEAGUE_ID, s.LEAGUE_NAME, s.LEAGUE_TYPE, s.COUNTRY_ID
             )
             """
 
@@ -334,7 +330,6 @@ def leagues_dag():
 
     # DAG wiring
     create_leagues_table()
-    create_league_seasons_table()
 
     country_selection = select_leagues_country(fetch_countries())
     season_selection = select_leagues_season(fetch_seasons())
@@ -343,7 +338,7 @@ def leagues_dag():
     update = advance_pointers(country_selection=country_selection, season_selection=season_selection)
     branch = are_leagues_exist(payload)
 
-    branch >> format_leagues(country_selection=country_selection, season_selection=season_selection) >> [load_leagues(), load_league_seasons()] >> update
+    branch >> format_leagues(country_selection=country_selection, season_selection=season_selection) >> load_leagues() >> create_league_seasons_table() >> load_league_seasons() >> update
     branch >> update
 
 leagues_dag()
