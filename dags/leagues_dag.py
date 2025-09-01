@@ -20,7 +20,6 @@ def leagues_dag():
               LEAGUE_NAME VARCHAR2(200) NOT NULL,
               LEAGUE_TYPE VARCHAR2(50),
               COUNTRY_ID  NUMBER,
-              SEASON_ID   NUMBER,
               CONSTRAINT FK_LEAGUES_COUNTRY
                 FOREIGN KEY (COUNTRY_ID) REFERENCES COUNTRIES(COUNTRY_ID)
             )';
@@ -211,7 +210,7 @@ def leagues_dag():
         @task
         def leagues_to_oracle(**context) -> str:
             rows = context['ti'].xcom_pull(key='formatted_leagues', task_ids='format_leagues')
-            rows = [(r["LEAGUE_ID"], r["LEAGUE_NAME"], r["LEAGUE_TYPE"], r["COUNTRY_ID"], r["SEASON_ID"]) for r in rows]
+            rows = [(r["LEAGUE_ID"], r["LEAGUE_NAME"], r["LEAGUE_TYPE"], r["COUNTRY_ID"]) for r in rows]
 
             sql = """
             MERGE INTO LEAGUES t
