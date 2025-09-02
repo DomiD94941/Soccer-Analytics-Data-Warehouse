@@ -87,7 +87,7 @@ def countries_dag():
     @task_group
     def load_countries(formatted_countries: list[dict[str, str]]):
         @task
-        def load_countries_csv(formatted_countries: list[dict[str, str]]) -> str:
+        def countries_to_csv(formatted_countries: list[dict[str, str]]) -> str:
             """
             Append-only CSV writer for COUNTRIES.
             """
@@ -123,7 +123,7 @@ def countries_dag():
             return f"Appended {len(new_rows)} new countries to {path}"
 
         @task
-        def load_countries_oracle_db(formatted_countries: list[dict[str, str]]) -> str:
+        def countries_to_oracle(formatted_countries: list[dict[str, str]]) -> str:
             """
             Insert-only load into Oracle (skip if COUNTRY_NAME already exists).
             """
@@ -152,7 +152,7 @@ def countries_dag():
 
             return f"Inserted {inserted} new countries into the database."
 
-        load_countries_csv(formatted_countries) >> load_countries_oracle_db(formatted_countries)
+        countries_to_csv(formatted_countries) >> countries_to_oracle(formatted_countries)
 
     create_countries_table()
     countries = is_api_available()
