@@ -113,7 +113,7 @@ def seasons_dag():
     @task_group
     def load_seasons(formatted_seasons: list[dict[str, int]]):
         @task
-        def load_seasons_csv(formatted_seasons: list[dict[str, int]]) -> str:
+        def seasons_to_csv(formatted_seasons: list[dict[str, int]]) -> str:
             """
             Append-only CSV writer for SEASONS:
             - Reads existing SEASON_IDs (if file exists)
@@ -152,7 +152,7 @@ def seasons_dag():
             return f"Appended {len(new_rows)} new seasons to {path}"
 
         @task
-        def load_seasons_oracle_db(formatted_seasons: list[dict[str, int]]) -> str:
+        def seasons_to_oracle(formatted_seasons: list[dict[str, int]]) -> str:
             """
             Insert-only load into Oracle (skip if SEASON_ID already exists):
             - Uses MERGE with only WHEN NOT MATCHED (no update clause)
