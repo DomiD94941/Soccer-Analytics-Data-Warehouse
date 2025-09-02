@@ -185,7 +185,7 @@ def seasons_dag():
 
             return f"Inserted {inserted} new seasons into the database."
 
-        load_seasons_csv(formatted_seasons) >> load_seasons_oracle_db(formatted_seasons)
+        (formatted_seasons) >> seasons_to_oracle(formatted_seasons)
 
     create_seasons_table() 
     seasons = is_api_available()
