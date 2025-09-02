@@ -6,7 +6,7 @@ from airflow.utils.trigger_rule import TriggerRule
 
 
 @dag
-def fixtures_team_stats_dag():
+def fixture_stats_dag():
 
     @task.sql(conn_id="oracle_default")
     def create_fixtures_team_stats_table():
@@ -162,7 +162,7 @@ def fixtures_team_stats_dag():
     @task_group
     def load_stats():
         @task
-        def to_csv(**context) -> str:
+        def fixture_stats_to_csv(**context) -> str:
             import os, csv
             rows = context['ti'].xcom_pull(key='fixture_team_stats_rows', task_ids='format_stats') or []
             path = "/tmp/fixture_team_stats.csv"
@@ -197,7 +197,7 @@ def fixtures_team_stats_dag():
             return f"Appended {len(new_rows)} rows to {path}"
 
         @task
-        def to_oracle(**context) -> str:
+        def fixture_stats_to_oracle(**context) -> str:
             rows = context['ti'].xcom_pull(key='fixture_team_stats_rows', task_ids='format_stats') or []
             if not rows:
                 return "No rows to upsert."
@@ -264,7 +264,7 @@ def fixtures_team_stats_dag():
                 conn.commit()
             return f"Upserted {upserted} rows."
 
-        to_csv() >> to_oracle()
+        fixture_stats_to_csv() >> fixture_stats_to_oracle()
 
     @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
     def advance_pointer(fixture_selection: dict) -> None:
@@ -282,4 +282,4 @@ def fixtures_team_stats_dag():
     branch >> update
 
 
-fixtures_team_stats_dag()
+fixture_stats_dag()
