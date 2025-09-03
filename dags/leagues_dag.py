@@ -216,7 +216,7 @@ def leagues_dag():
             rows = [(r["LEAGUE_ID"], r["LEAGUE_NAME"], r["LEAGUE_TYPE"], r["COUNTRY_ID"]) for r in rows]
 
             sql = """
-            MERGE INTO LEAGUES t
+            MERGE INTO LEAGUES l
             USING (
               SELECT :1 AS LEAGUE_ID,
                      :2 AS LEAGUE_NAME,
@@ -224,11 +224,13 @@ def leagues_dag():
                      :4 AS COUNTRY_ID
               FROM dual
             ) s
-            ON (t.LEAGUE_ID = s.LEAGUE_ID)
+            ON (l.LEAGUE_ID = s.LEAGUE_ID)
             WHEN NOT MATCHED THEN INSERT (
               LEAGUE_ID, LEAGUE_NAME, LEAGUE_TYPE, COUNTRY_ID
             ) VALUES (
               s.LEAGUE_ID, s.LEAGUE_NAME, s.LEAGUE_TYPE, s.COUNTRY_ID
+            ) WHERE EXISTS (
+              SELECT 1 FROM LEAGUES l WHERE (l.COUNTRY_ID = s.COUNTRY_ID)
             )
             """
 
@@ -286,7 +288,7 @@ def leagues_dag():
                 return "No league-season rows to insert."
 
             sql = """
-            MERGE INTO LEAGUE_SEASONS t
+            MERGE INTO LEAGUE_SEASONS ls
             USING (
               SELECT :1 AS LEAGUE_ID,
                      :2 AS SEASON_ID,
@@ -294,12 +296,13 @@ def leagues_dag():
                      TO_DATE(:4, 'YYYY-MM-DD') AS END_DATE
               FROM dual
             ) s
-            ON (t.LEAGUE_ID = s.LEAGUE_ID AND t.SEASON_ID = s.SEASON_ID)
+            ON (ls.LEAGUE_ID = s.LEAGUE_ID AND ls.SEASON_ID = s.SEASON_ID)
             WHEN NOT MATCHED THEN INSERT (
               LEAGUE_ID, SEASON_ID, START_DATE, END_DATE
             ) VALUES (
               s.LEAGUE_ID, s.SEASON_ID, s.START_DATE, s.END_DATE
-            )
+            ) WHERE EXISTS (SELECT 1 FROM LEAGUE_SEASONS ls WHERE ls.LEAGUE_ID = s.LEAGUE_ID) 
+              AND EXISTS (SELECT 1 FROM LEAGUE_SEASONS ls WHERE ls.SEASON_ID = s.SEASON_ID)
             """
 
             hook = OracleHook(oracle_conn_id="oracle_default")

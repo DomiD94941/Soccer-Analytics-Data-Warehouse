@@ -271,7 +271,7 @@ def fixtures_dag():
                 return "No rows to insert."
 
             sql = """
-            MERGE INTO FIXTURES t
+            MERGE INTO FIXTURES f
             USING (
               SELECT
                 :1  AS FIXTURE_ID,
@@ -300,7 +300,7 @@ def fixtures_dag():
                 :24 AS SEASON_ID
               FROM dual
             ) s
-            ON (t.FIXTURE_ID = s.FIXTURE_ID)
+            ON (f.FIXTURE_ID = s.FIXTURE_ID)
             WHEN NOT MATCHED THEN INSERT (
               FIXTURE_ID, REFEREE, TZ, KICKOFF_UTC, STATUS_LONG, STATUS_SHORT, STATUS_ELAPSED, STATUS_EXTRA,
               ROUND_NAME, HOME_TEAM_ID, AWAY_TEAM_ID,
@@ -311,6 +311,9 @@ def fixtures_dag():
               s.ROUND_NAME, s.HOME_TEAM_ID, s.AWAY_TEAM_ID,
               s.GOALS_HOME, s.GOALS_AWAY, s.HT_HOME, s.HT_AWAY, s.FT_HOME, s.FT_AWAY, s.ET_HOME, s.ET_AWAY, s.PEN_HOME, s.PEN_AWAY,
               s.VENUE_ID, s.LEAGUE_ID, s.SEASON_ID
+            ) WHERE EXISTS (SELECT 1 FROM FIXTURES f WHERE f.VENUE_ID = s.VENUE_ID)
+                AND EXISTS (SELECT 1 FROM TEAMS f WHERE f.LEAGUE_ID = s.LEAGUE_ID)
+                AND EXISTS (SELECT 1 FROM SEASONS f WHERE f.SEASON_ID = s.SEASON_ID)
             )
             """
             hook = OracleHook(oracle_conn_id="oracle_default")

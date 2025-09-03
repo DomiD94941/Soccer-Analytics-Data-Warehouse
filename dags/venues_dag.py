@@ -154,7 +154,7 @@ def venues_dag():
                 return "No rows to insert."
 
             sql = """
-            MERGE INTO VENUES t
+            MERGE INTO VENUES v
             USING (
               SELECT :1 AS VENUE_ID,
                      :2 AS VENUE_NAME,
@@ -165,12 +165,12 @@ def venues_dag():
                      :7 AS SURFACE
               FROM dual
             ) s
-            ON (t.VENUE_ID = s.VENUE_ID)
+            ON (v.VENUE_ID = s.VENUE_ID)
             WHEN NOT MATCHED THEN INSERT (
               VENUE_ID, VENUE_NAME, ADDRESS, CITY, COUNTRY_ID, CAPACITY, SURFACE
             ) VALUES (
               s.VENUE_ID, s.VENUE_NAME, s.ADDRESS, s.CITY, s.COUNTRY_ID, s.CAPACITY, s.SURFACE
-            )
+            ) WHERE EXISTS (SELECT 1 FROM VENUES v WHERE v.COUNTRY_ID = s.COUNTRY_ID)
             """
 
             hook = OracleHook(oracle_conn_id="oracle_default")

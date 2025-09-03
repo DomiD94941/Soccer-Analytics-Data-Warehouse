@@ -57,7 +57,7 @@ def fixture_stats_dag():
 
     @task
     def select_fixture(fixtures: list[dict[str, int]]) -> dict[str, int]:
-        key = "fixtures_team_stats_fixture_id_indicator"
+        key = "fixture_stats_fixture_id_indicator"
         idx = int(Variable.get(key, default=0))
         total = len(fixtures)
         if total == 0:
@@ -93,7 +93,7 @@ def fixture_stats_dag():
     def are_stats_exist(payload: dict, **context):
         data = payload.get("response", []) if payload else []
         if not data:
-            return "advance_pointer"
+            return "advance_fixtures_stats_fixture_id_pointer"
         context['ti'].xcom_push(key='stats_payload', value=data)
         return "format_stats"
 
@@ -243,7 +243,7 @@ def fixture_stats_dag():
               s.SHOTS_INSIDE_BOX, s.SHOTS_OUTSIDE_BOX, s.FOULS, s.CORNER_KICKS, s.OFFSIDES,
               s.BALL_POSSESSION_PCT, s.YELLOW_CARDS, s.RED_CARDS, s.GOALKEEPER_SAVES,
               s.TOTAL_PASSES, s.PASSES_ACCURATE, s.PASSES_PCT
-            )
+            ) WHERE EXISTS (SELECT 1 FROM FIXTURE_TEAM_STATS f WHERE f.TEAM_ID = s.TEAM_ID)
             """
             bind_rows = [
                 (
@@ -267,16 +267,18 @@ def fixture_stats_dag():
         fixture_stats_to_csv() >> fixture_stats_to_oracle()
 
     @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
-    def advance_pointer(fixture_selection: dict) -> None:
-        key, idx, total = fixture_selection["key"], fixture_selection["idx"], fixture_selection["total"]
-        next_idx = 0 if total == 0 else (idx + 1) % total
-        Variable.set(key, str(next_idx))
+    def advance_fixtures_stats_fixture_id_pointer(fixture_selection: dict) -> None:
+        f_key, f_idx, f_total = fixture_selection["key"], fixture_selection["idx"], fixture_selection["total"]
+        next_f = f_idx + 1
+        if next_f < f_total:
+            next_f = 0
+        Variable.set(f_key, str(next_f))
 
     create_fixtures_team_stats_table()
     fixture_sel = select_fixture(fetch_fixtures())
     payload = is_api_available(fixture_selection=fixture_sel)
     branch = are_stats_exist(payload)
-    update = advance_pointer(fixture_selection=fixture_sel)
+    update = advance_fixtures_stats_fixture_id_pointer(fixture_selection=fixture_sel)
 
     branch >> format_stats(fixture_selection=fixture_sel) >> load_stats() >> update
     branch >> update
