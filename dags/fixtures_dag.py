@@ -149,7 +149,6 @@ def fixtures_dag():
         context['ti'].xcom_push(key='available_fixtures', value=fixtures)
         return "format_fixtures"
 
-    # ---------- transform ----------
     @task
     def format_fixtures(league_selection: dict, season_selection: dict, **context) -> list[dict]:
         """
@@ -311,10 +310,11 @@ def fixtures_dag():
               s.ROUND_NAME, s.HOME_TEAM_ID, s.AWAY_TEAM_ID,
               s.GOALS_HOME, s.GOALS_AWAY, s.HT_HOME, s.HT_AWAY, s.FT_HOME, s.FT_AWAY, s.ET_HOME, s.ET_AWAY, s.PEN_HOME, s.PEN_AWAY,
               s.VENUE_ID, s.LEAGUE_ID, s.SEASON_ID
-            ) WHERE EXISTS (SELECT 1 FROM FIXTURES f WHERE f.VENUE_ID = s.VENUE_ID)
-                AND EXISTS (SELECT 1 FROM TEAMS f WHERE f.LEAGUE_ID = s.LEAGUE_ID)
-                AND EXISTS (SELECT 1 FROM SEASONS f WHERE f.SEASON_ID = s.SEASON_ID)
-            )
+            ) WHERE EXISTS (SELECT 1 FROM VENUES v WHERE v.VENUE_ID = s.VENUE_ID)
+              AND EXISTS (SELECT 1 FROM LEAGUES l WHERE l.LEAGUE_ID = s.LEAGUE_ID)
+              AND EXISTS (SELECT 1 FROM SEASONS se WHERE se.SEASON_ID = s.SEASON_ID)
+              AND EXISTS (SELECT 1 FROM TEAMS th WHERE th.TEAM_ID = s.HOME_TEAM_ID)
+              AND EXISTS (SELECT 1 FROM TEAMS ta WHERE ta.TEAM_ID = s.AWAY_TEAM_ID)
             """
             hook = OracleHook(oracle_conn_id="oracle_default")
             with hook.get_conn() as conn:

@@ -170,7 +170,7 @@ def venues_dag():
               VENUE_ID, VENUE_NAME, ADDRESS, CITY, COUNTRY_ID, CAPACITY, SURFACE
             ) VALUES (
               s.VENUE_ID, s.VENUE_NAME, s.ADDRESS, s.CITY, s.COUNTRY_ID, s.CAPACITY, s.SURFACE
-            ) WHERE EXISTS (SELECT 1 FROM VENUES v WHERE v.COUNTRY_ID = s.COUNTRY_ID)
+            ) WHERE EXISTS (SELECT 1 FROM COUNTRIES c WHERE c.COUNTRY_ID = s.COUNTRY_ID)
             """
 
             hook = OracleHook(oracle_conn_id="oracle_default")

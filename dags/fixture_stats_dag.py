@@ -53,7 +53,7 @@ def fixture_stats_dag():
             with conn.cursor() as cur:
                 cur.execute("SELECT FIXTURE_ID FROM FIXTURES ORDER BY FIXTURE_ID")
                 rows = cur.fetchall()
-        return [{"FIXTURE_ID": 215662}]
+        return [{"FIXTURE_ID": r[0]} for r in rows]
 
     @task
     def select_fixture(fixtures: list[dict[str, int]]) -> dict[str, int]:

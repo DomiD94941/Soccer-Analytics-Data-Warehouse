@@ -20,9 +20,6 @@ def leagues_dag():
               LEAGUE_NAME VARCHAR2(200) NOT NULL,
               LEAGUE_TYPE VARCHAR2(50),
               COUNTRY_ID  NUMBER,
-              SEASON_ID NUMBER,
-              CONSTRAINT FK_LEAGUES_SEASON
-                FOREIGN KEY (SEASON_ID) REFERENCES SEASONS(SEASON_ID),
               CONSTRAINT FK_LEAGUES_COUNTRY
                 FOREIGN KEY (COUNTRY_ID) REFERENCES COUNTRIES(COUNTRY_ID)
             )';
@@ -229,9 +226,7 @@ def leagues_dag():
               LEAGUE_ID, LEAGUE_NAME, LEAGUE_TYPE, COUNTRY_ID
             ) VALUES (
               s.LEAGUE_ID, s.LEAGUE_NAME, s.LEAGUE_TYPE, s.COUNTRY_ID
-            ) WHERE EXISTS (
-              SELECT 1 FROM LEAGUES l WHERE (l.COUNTRY_ID = s.COUNTRY_ID)
-            )
+            ) WHERE EXISTS (SELECT 1 FROM COUNTRIES c WHERE c.COUNTRY_ID = s.COUNTRY_ID)
             """
 
             hook = OracleHook(oracle_conn_id="oracle_default")
@@ -301,8 +296,8 @@ def leagues_dag():
               LEAGUE_ID, SEASON_ID, START_DATE, END_DATE
             ) VALUES (
               s.LEAGUE_ID, s.SEASON_ID, s.START_DATE, s.END_DATE
-            ) WHERE EXISTS (SELECT 1 FROM LEAGUE_SEASONS ls WHERE ls.LEAGUE_ID = s.LEAGUE_ID) 
-              AND EXISTS (SELECT 1 FROM LEAGUE_SEASONS ls WHERE ls.SEASON_ID = s.SEASON_ID)
+            ) WHERE EXISTS (SELECT 1 FROM LEAGUES l WHERE l.LEAGUE_ID = s.LEAGUE_ID)
+                AND EXISTS (SELECT 1 FROM SEASONS se WHERE se.SEASON_ID = s.SEASON_ID)
             """
 
             hook = OracleHook(oracle_conn_id="oracle_default")
