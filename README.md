@@ -40,6 +40,8 @@ In the **Extra** section of the connection, add:
 
 ## Import variables file
 
+```bash 
 docker exec -it soccer-analytics-data-warehouse-airflow-scheduler-1 /bin/bash
 
 airflow variables import /opt/airflow/secrets/var.json
+```
