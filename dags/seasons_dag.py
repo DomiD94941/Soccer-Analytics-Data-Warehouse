@@ -3,15 +3,27 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.sensors.base import PokeReturnValue
 from airflow.providers.oracle.hooks.oracle import OracleHook
 
+
 @dag
 def seasons_dag():
+    """
+    Airflow DAG for loading football seasons into Oracle.
+    Steps:
+      1. Create SEASONS table (if missing)
+      2. Check if API /leagues/seasons is available
+      3. Validate seasons from API
+      4. Branch based on subscription plan:
+         - Free plan -> fixed years [2021, 2022, 2023]
+         - Paid plan -> use API seasons
+      5. Load seasons into CSV + Oracle
+    """
 
     @task.sql(conn_id="oracle_default")
     def create_seasons_table():
-        """
-        Create SEASONS table if it does not exist.
-        """
-
+        # Creates SEASONS table if it doesn’t exist
+        # Columns:
+        #   SEASON_ID   -> surrogate key (auto-generated)
+        #   SEASON_YEAR -> year (e.g. 2023)
         return """
         DECLARE
           e_exists EXCEPTION;
@@ -29,11 +41,9 @@ def seasons_dag():
 
     @task.sensor(poke_interval=30, timeout=120)
     def is_api_available() -> PokeReturnValue:
-        """
-        Check if the API is available.
-        """
+        # Sensor: check if football API /leagues/seasons endpoint is available
+        # Retries every 30s, times out after 2 minutes
         import requests
-
         log = LoggingMixin().log
 
         api_key = Variable.get("API_KEY")
@@ -56,12 +66,11 @@ def seasons_dag():
     
     @task
     def are_seasons_exist(payload: dict) -> list:
-        """
-        Validate that seasons exist in the API response.
-        """
+        # Validate API response contains at least one season
+        # Raises AirflowSkipException if empty
         from airflow.exceptions import AirflowSkipException
-
         log = LoggingMixin().log
+
         available_seasons = payload.get("response", [])
         if not available_seasons:
             log.warning("No seasons found in API response.")
@@ -72,9 +81,9 @@ def seasons_dag():
     
     @task.branch
     def choose_plan() -> str:
-        """
-        Decide which downstream task to run.
-        """
+        # Branching task: decides which path to take based on subscription plan
+        # - Free plan -> call format_seasons_free_plan
+        # - Paid plan -> call format_seasons_paid_plan
         import requests
         log = LoggingMixin().log
         api_key = Variable.get("API_KEY")
@@ -97,44 +106,36 @@ def seasons_dag():
         
     @task
     def format_seasons_free_plan() -> list[dict[str, int]]:
-        """
-        Free plan: ignore API seasons and return fixed years.
-        """
+        # For free plan: return fixed list of seasons
         fixed = [2021, 2022, 2023]
         return [{"SEASON_ID": i, "SEASON_YEAR": year} for i, year in enumerate(fixed, start=1)]
 
     @task
     def format_seasons_paid_plan(available_seasons: list[int]) -> list[dict[str, int]]:
-        """
-        Paid plan: map seasons into SEASONS-table-shaped dicts.
-        """
+        # For paid plan: transform API seasons into SEASONS table schema
         return [{"SEASON_ID": i, "SEASON_YEAR": year} for i, year in enumerate(available_seasons, start=1)]
 
     @task_group
     def load_seasons(formatted_seasons: list[dict[str, int]]):
+        # Task group: save seasons into CSV + Oracle DB
+
         @task
         def seasons_to_csv(formatted_seasons: list[dict[str, int]]) -> str:
-            """
-            Append-only CSV writer for SEASONS:
-            - Reads existing SEASON_IDs (if file exists)
-            - Appends only NEW rows (skips IDs already present; also dedupes within batch)
-            - Writes header once when the file is empty/new
-            """
-            import os
-            import csv
-
+            # Append-only writer for /tmp/seasons.csv
+            # Skips duplicates (based on SEASON_ID)
+            import os, csv
             path = "/tmp/seasons.csv"
-
             fieldnames = list(formatted_seasons[0].keys())
 
+            # Collect already existing IDs
             existing_ids = set()
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 with open(path, newline="", encoding="utf-8") as f:
                     for row in csv.DictReader(f):
                         existing_ids.add(str(row.get("SEASON_ID", "")).strip())
 
-            seen_batch = set()
-            new_rows = []
+            # Deduplicate within batch
+            seen_batch, new_rows = set(), []
             for row in formatted_seasons:
                 season_id = str(row.get("SEASON_ID", "")).strip()
                 if not season_id or season_id in existing_ids or season_id in seen_batch:
@@ -142,6 +143,7 @@ def seasons_dag():
                 seen_batch.add(season_id)
                 new_rows.append(row)
 
+            # Write new rows
             with open(path, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 if f.tell() == 0:
@@ -153,13 +155,8 @@ def seasons_dag():
 
         @task
         def seasons_to_oracle(formatted_seasons: list[dict[str, int]]) -> str:
-            """
-            Insert-only load into Oracle (skip if SEASON_ID already exists):
-            - Uses MERGE with only WHEN NOT MATCHED (no update clause)
-            - Works idempotently across multiple DAG runs
-            - executemany with named binds for efficiency
-            """
-
+            # Inserts seasons into Oracle SEASONS table
+            # MERGE ensures duplicates are skipped
             sql = """
                 MERGE INTO SEASONS t
                 USING (
@@ -187,6 +184,7 @@ def seasons_dag():
 
         (formatted_seasons) >> seasons_to_oracle(formatted_seasons)
 
+    # DAG wiring (task dependencies)
     create_seasons_table() 
     seasons = is_api_available()
     available_seasons = are_seasons_exist(seasons)
@@ -194,5 +192,5 @@ def seasons_dag():
     branch >> load_seasons(format_seasons_free_plan())
     branch >> load_seasons(format_seasons_paid_plan(available_seasons))
 
-seasons_dag()
 
+seasons_dag()
