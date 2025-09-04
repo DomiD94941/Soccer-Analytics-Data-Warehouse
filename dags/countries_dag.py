@@ -3,14 +3,26 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.sensors.base import PokeReturnValue
 from airflow.providers.oracle.hooks.oracle import OracleHook
 
+
 @dag
 def countries_dag():
+    """
+    Airflow DAG for loading countries metadata into Oracle.
+    Steps:
+      1. Create COUNTRIES table (if missing)
+      2. Check if football API is available
+      3. Fetch and validate list of countries
+      4. Transform into table schema
+      5. Save results into CSV and Oracle DB
+    """
 
     @task.sql(conn_id="oracle_default")
     def create_countries_table():
-        """
-        Create COUNTRIES table if it does not exist.
-        """
+        # Creates COUNTRIES table in Oracle if it does not already exist
+        # Columns:
+        #   COUNTRY_ID  -> primary key, auto-increment
+        #   COUNTRY_NAME -> full country name
+        #   COUNTRY_CODE -> short code (e.g., "PL", "US")
         return """
         DECLARE
           e_exists EXCEPTION;
@@ -29,11 +41,10 @@ def countries_dag():
 
     @task.sensor(poke_interval=30, timeout=120)
     def is_api_available() -> PokeReturnValue:
-        """
-        Check if the Countries API is available.
-        """
+        # Checks if football API is reachable
+        # Retries every 30 seconds, fails after 2 minutes
+        # Returns API payload as XCom if successful
         import requests
-
         log = LoggingMixin().log
 
         api_key = Variable.get("API_KEY")
@@ -56,9 +67,8 @@ def countries_dag():
 
     @task
     def are_countries_exist(countries: dict) -> list:
-        """
-        Validate that countries exist in the API response.
-        """
+        # Validates that the API response contains at least one country
+        # Raises AirflowSkipException if no data
         from airflow.exceptions import AirflowSkipException
 
         log = LoggingMixin().log
@@ -72,10 +82,8 @@ def countries_dag():
 
     @task
     def format_countries(available_countries: list[dict]) -> list[dict[str, str]]:
-        """
-        Transform raw API payload to table-shaped dicts with column names
-        matching the COUNTRIES table schema.
-        """
+        # Transforms raw API response into rows matching COUNTRIES table schema
+        # Example: {"COUNTRY_NAME": "Poland", "COUNTRY_CODE": "PL"}
         formatted = []
         for country in available_countries:
             formatted.append({
@@ -86,24 +94,26 @@ def countries_dag():
 
     @task_group
     def load_countries(formatted_countries: list[dict[str, str]]):
+        # Task group for loading data into CSV and Oracle
+
         @task
         def countries_to_csv(formatted_countries: list[dict[str, str]]) -> str:
-            """
-            Append-only CSV writer for COUNTRIES.
-            """
+            # Saves countries to /tmp/countries.csv
+            # Appends only new countries (avoids duplicates)
             import os
             import csv
 
             path = "/tmp/countries.csv"
-
             fieldnames = list(formatted_countries[0].keys())
 
+            # Read existing CSV to collect already saved country names
             existing_names = set()
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 with open(path, newline="", encoding="utf-8") as f:
                     for row in csv.DictReader(f):
                         existing_names.add(row.get("COUNTRY_NAME", "").strip())
 
+            # Deduplicate batch before writing
             seen_batch = set()
             new_rows = []
             for row in formatted_countries:
@@ -113,6 +123,7 @@ def countries_dag():
                 seen_batch.add(name)
                 new_rows.append(row)
 
+            # Write rows (append mode)
             with open(path, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 if f.tell() == 0:
@@ -124,9 +135,8 @@ def countries_dag():
 
         @task
         def countries_to_oracle(formatted_countries: list[dict[str, str]]) -> str:
-            """
-            Insert-only load into Oracle (skip if COUNTRY_NAME already exists).
-            """
+            # Inserts countries into Oracle DB using MERGE
+            # Skips rows if COUNTRY_NAME already exists
             sql = """
                 MERGE INTO COUNTRIES t
                 USING (
@@ -152,12 +162,16 @@ def countries_dag():
 
             return f"Inserted {inserted} new countries into the database."
 
+        # First write CSV, then insert into Oracle
         countries_to_csv(formatted_countries) >> countries_to_oracle(formatted_countries)
 
+    # DAG flow definition
     create_countries_table()
     countries = is_api_available()
     available_countries = are_countries_exist(countries)
     formatted_countries = format_countries(available_countries)
     load_countries(formatted_countries)
 
+
+# Instantiate DAG
 countries_dag()
