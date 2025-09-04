@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from airflow.sdk import dag, task, task_group, Variable
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.sensors.base import PokeReturnValue
@@ -9,9 +7,20 @@ from airflow.utils.trigger_rule import TriggerRule
 
 @dag
 def fixtures_dag():
+    """
+    Airflow DAG for ingesting match fixtures into Oracle.
+    Steps:
+      1) Ensure FIXTURES table exists
+      2) Round-robin select season + league via Airflow Variables
+      3) Call API /fixtures for that (league, season)
+      4) If data -> format -> CSV -> Oracle
+      5) Advance pointers so next run picks the next slice
+    """
 
     @task.sql(conn_id="oracle_default")
     def create_fixtures_table():
+        # Creates FIXTURES if it does not exist (idempotent CREATE block)
+        # FK constraints rely on VENUES, LEAGUES, SEASONS, TEAMS being pre-populated
         return """
         DECLARE
           e_exists EXCEPTION;
@@ -62,6 +71,7 @@ def fixtures_dag():
     
     @task
     def fetch_seasons() -> list[dict[str, int]]:
+        # Reads seasons from SEASONS table; returns list of dicts with SEASON_ID/SEASON_YEAR
         hook = OracleHook(oracle_conn_id="oracle_default")
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
@@ -71,6 +81,7 @@ def fixtures_dag():
 
     @task
     def select_fixtures_season(seasons: list[dict[str, int]]) -> dict[str, int]:
+        # Round-robin season selector persisted in Airflow Variable
         key = "fixtures_season_id_indicator"
         idx = int(Variable.get(key, default=0))
         total = len(seasons)
@@ -86,6 +97,7 @@ def fixtures_dag():
 
     @task
     def fetch_leagues() -> list[dict[str, int | str]]:
+        # Reads leagues from LEAGUES table; returns list of dicts with LEAGUE_ID/LEAGUE_NAME
         hook = OracleHook(oracle_conn_id="oracle_default")
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
@@ -95,10 +107,12 @@ def fixtures_dag():
 
     @task
     def select_fixtures_league(leagues: list[dict[str, int | str]]) -> dict[str, int | str]:
+        # Round-robin league selector persisted in Airflow Variable
         key = "fixtures_league_id_indicator"
         idx = int(Variable.get(key, default=0))
         total = len(leagues)
         if total == 0:
+            # Handle empty LEAGUES table gracefully
             return {"key": key, "idx": 0, "total": 0}
         if idx >= total:
             idx = 0
@@ -112,6 +126,8 @@ def fixtures_dag():
 
     @task.sensor(poke_interval=30, timeout=120)
     def is_api_available(season_selection: dict, league_selection: dict) -> PokeReturnValue:
+        # Sensor to verify /fixtures endpoint availability for selected (league, season)
+        # Polls every 30s up to 2min; returns JSON payload via XCom on success
         import requests
         log = LoggingMixin().log
 
@@ -140,6 +156,9 @@ def fixtures_dag():
 
     @task.branch
     def are_fixtures_exist(payload: dict, **context):
+        # Branching:
+        #  - If no fixtures -> jump to pointer advance (skip formatting/loading)
+        #  - If fixtures -> push to XCom and continue
         log = LoggingMixin().log
         fixtures = payload.get("response", []) if payload else []
         if not fixtures:
@@ -151,13 +170,9 @@ def fixtures_dag():
 
     @task
     def format_fixtures(league_selection: dict, season_selection: dict, **context) -> list[dict]:
-        """
-        Build rows for FIXTURES (no periods or logos):
-        FIXTURE_ID, REFEREE, TZ, KICKOFF_UTC, STATUS_*, ROUND_NAME,
-        HOME_TEAM_ID, AWAY_TEAM_ID,
-        GOALS_HOME/GOALS_AWAY, halftime/fulltime/extratime/penalty splits,
-        VENUE_ID, LEAGUE_ID, SEASON_ID
-        """
+        # Transforms API payload into FIXTURES table rows (no logos/media fields)
+        # Maps ISO datetime to naive UTC for Oracle DATE
+        # Pushes formatted rows to XCom for loaders
         from datetime import datetime, timezone
 
         data = context['ti'].xcom_pull(key='available_fixtures', task_ids='are_fixtures_exist') or []
@@ -172,7 +187,7 @@ def fixtures_dag():
             goals = item.get("goals", {}) or {}
             score = item.get("score", {}) or {}
 
-            # datetime -> naive UTC (Oracle DATE)
+            # Convert API ISO timestamp to naive UTC datetime (Oracle DATE compatible)
             dt_iso = fx.get("date")
             dt_utc_naive = None
             if dt_iso:
@@ -217,8 +232,12 @@ def fixtures_dag():
 
     @task_group
     def load_fixtures():
+        # TaskGroup for saving fixtures to CSV and Oracle
+
         @task
         def fixtures_to_csv(**context) -> str:
+            # Append-only writer to /tmp/fixtures.csv
+            # Dedupe by FIXTURE_ID (existing file + current batch)
             import os, csv
             rows = context['ti'].xcom_pull(key='formatted_fixtures', task_ids='format_fixtures') or []
             path = "/tmp/fixtures.csv"
@@ -253,6 +272,8 @@ def fixtures_dag():
 
         @task
         def fixtures_to_oracle(**context) -> str:
+            # MERGE-only insert into FIXTURES (skips existing by FIXTURE_ID)
+            # Enforces referential integrity via WHERE EXISTS checks
             rows = context['ti'].xcom_pull(key='formatted_fixtures', task_ids='format_fixtures') or []
             rows = [
                 (
@@ -328,6 +349,9 @@ def fixtures_dag():
 
     @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
     def advance_pointers(season_selection: dict, league_selection: dict) -> None:
+        # Advances round-robin indices:
+        #  - Increment season index; if wrapped, increment league index
+        #  - Runs even if upstream partially failed (NONE_FAILED_MIN_ONE_SUCCESS)
         s_key, s_idx, s_total = season_selection["key"], season_selection["idx"], season_selection["total"]
         l_key, l_idx, l_total = league_selection["key"], league_selection.get("idx", 0), league_selection.get("total", 0)
 
@@ -342,16 +366,22 @@ def fixtures_dag():
                 next_l = 0
             Variable.set(l_key, str(next_l))
 
+    # DAG wiring (task dependencies)
     create_fixtures_table()
 
+    # Select (league, season) pair for this run
     league_sel = select_fixtures_league(fetch_leagues())
     season_sel = select_fixtures_season(fetch_seasons())
 
+    # Probe API and branch based on presence of fixtures
     payload = is_api_available(league_selection=league_sel, season_selection=season_sel)
     branch = are_fixtures_exist(payload)
     update = advance_pointers(league_selection=league_sel, season_selection=season_sel)
 
+    # If data exists: format -> load -> advance pointers
     branch >> format_fixtures(league_selection=league_sel, season_selection=season_sel) >> load_fixtures() >> update
+    # If no data: advance pointers directly
     branch >> update
+
 
 fixtures_dag()
