@@ -4,11 +4,27 @@ from airflow.sensors.base import PokeReturnValue
 from airflow.providers.oracle.hooks.oracle import OracleHook
 from airflow.utils.trigger_rule import TriggerRule
 
+
 @dag
 def leagues_dag():
+    """
+    Airflow DAG for loading football leagues and their seasons into Oracle.
+    Flow:
+      1) Ensure target tables exist (LEAGUES, LEAGUE_SEASONS)
+      2) Round-robin pick of (country, season) via Airflow Variables
+      3) Call API /leagues?country=...&season=...
+      4) If data exists -> format -> CSV -> Oracle
+      5) Advance pointers for next run (even on partial success)
+    """
 
     @task.sql(conn_id="oracle_default")
     def create_leagues_table():
+        # Creates LEAGUES if missing
+        # Columns:
+        #   LEAGUE_ID   -> API league id (PK)
+        #   LEAGUE_NAME -> league display name
+        #   LEAGUE_TYPE -> e.g., "League", "Cup"
+        #   COUNTRY_ID  -> FK to COUNTRIES(COUNTRY_ID)
         return """
         DECLARE
           e_exists EXCEPTION;
@@ -29,6 +45,9 @@ def leagues_dag():
 
     @task.sql(conn_id="oracle_default")
     def create_league_seasons_table():
+        # Creates LEAGUE_SEASONS (junction) if missing
+        # Composite PK: (LEAGUE_ID, SEASON_ID)
+        # START_DATE/END_DATE stored as DATE (parsed from 'YYYY-MM-DD')
         return """
         DECLARE
           e_exists EXCEPTION;
@@ -50,6 +69,7 @@ def leagues_dag():
 
     @task
     def fetch_seasons() -> list[dict[str, int]]:
+        # Reads seasons from SEASONS table (populated by seasons_dag)
         hook = OracleHook(oracle_conn_id="oracle_default")
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
@@ -59,6 +79,7 @@ def leagues_dag():
 
     @task
     def fetch_countries() -> list[dict[str, str | int | None]]:
+        # Reads countries from COUNTRIES table (populated by countries_dag)
         hook = OracleHook(oracle_conn_id="oracle_default")
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
@@ -68,6 +89,8 @@ def leagues_dag():
 
     @task
     def select_leagues_season(seasons: list[dict[str, int]]) -> dict[str, int]:
+        # Round-robin season selector using Airflow Variable
+        # Variable key keeps index across runs; wraps when reaching the end
         season_id_indicator = "leagues_season_id_indicator"
         idx = int(Variable.get(season_id_indicator, default=0))
         total = len(seasons)
@@ -83,6 +106,7 @@ def leagues_dag():
 
     @task
     def select_leagues_country(countries: list[dict[str, str | int | None]]) -> dict[str, str | int | None]:
+        # Round-robin country selector using Airflow Variable (independent pointer)
         country_id_indicator = "leagues_country_id_indicator"
         idx = int(Variable.get(country_id_indicator, default=0))
         total = len(countries)
@@ -98,6 +122,8 @@ def leagues_dag():
 
     @task.sensor(poke_interval=30, timeout=120)
     def is_api_available(country_selection: dict, season_selection: dict) -> PokeReturnValue:
+        # Sensor for API availability for a given (country, season)
+        # Polls /leagues with ?country=...&season=...
         import requests
         log = LoggingMixin().log
         api_key = Variable.get("API_KEY")
@@ -122,6 +148,9 @@ def leagues_dag():
 
     @task.branch
     def are_leagues_exist(payload: dict, **context):
+        # Branching:
+        #  - If no leagues -> jump to pointer advance (skip formatting/loading)
+        #  - If leagues -> push to XCom and continue
         log = LoggingMixin().log
         available_leagues = payload.get("response", [])
         if not available_leagues:
@@ -133,11 +162,9 @@ def leagues_dag():
 
     @task
     def format_leagues(country_selection, season_selection, **context) -> list[dict]:
-        """
-        Builds:
-        - LEAGUES rows: LEAGUE_ID, LEAGUE_NAME, LEAGUE_TYPE, COUNTRY_ID, SEASON_ID
-        - LEAGUE_SEASONS rows: LEAGUE_ID, SEASON_ID, START_DATE(str), END_DATE(str)
-        """
+        # Transforms API payload into two datasets:
+        #   1) LEAGUES rows:   LEAGUE_ID, LEAGUE_NAME, LEAGUE_TYPE, COUNTRY_ID
+        #   2) LEAGUE_SEASONS: LEAGUE_ID, SEASON_ID, START_DATE(str), END_DATE(str)
         country_id = country_selection["country_id"]
         season_id = season_selection["season_id"]
         target_year = season_selection["season_year"]
@@ -155,6 +182,7 @@ def leagues_dag():
             league_name = league.get("name")
             league_type = league.get("type")
 
+            # Collect league master data (FK to COUNTRIES by COUNTRY_ID)
             leagues_rows.append({
                 "LEAGUE_ID": league_id,
                 "LEAGUE_NAME": league_name,
@@ -162,24 +190,29 @@ def leagues_dag():
                 "COUNTRY_ID": country_id
             })
 
-            # seasons array from API; pick the one for target_year
+            # Find the season object matching the requested target_year
             for s in (entry.get("seasons") or []):
                 if s.get("year") == target_year:
                     league_seasons_rows.append({
                         "LEAGUE_ID": league_id,
                         "SEASON_ID": season_id,
-                        "START_DATE": s.get("start"),   # 'YYYY-MM-DD'
-                        "END_DATE": s.get("end")        # 'YYYY-MM-DD'
+                        "START_DATE": s.get("start"),  # 'YYYY-MM-DD'
+                        "END_DATE": s.get("end")       # 'YYYY-MM-DD'
                     })
-                    break  # only one per year
+                    break  # only one season entry per year needed
 
+        # Push both datasets for downstream CSV/DB loaders
         context['ti'].xcom_push(key='formatted_leagues', value=leagues_rows)
         context['ti'].xcom_push(key='formatted_league_seasons', value=league_seasons_rows)
 
     @task_group
     def load_leagues():
+        # Handles CSV + DB load for LEAGUES
+
         @task
         def leagues_to_csv(**context) -> str:
+            # Append-only write to /tmp/leagues.csv
+            # Dedupe by LEAGUE_ID (existing file + current batch)
             import os, csv
             rows = context['ti'].xcom_pull(key='formatted_leagues', task_ids='format_leagues')
             path = "/tmp/leagues.csv"
@@ -209,6 +242,7 @@ def leagues_dag():
 
         @task
         def leagues_to_oracle(**context) -> str:
+            # MERGE-only insert into LEAGUES (skips existing by LEAGUE_ID)
             rows = context['ti'].xcom_pull(key='formatted_leagues', task_ids='format_leagues')
             rows = [(r["LEAGUE_ID"], r["LEAGUE_NAME"], r["LEAGUE_TYPE"], r["COUNTRY_ID"]) for r in rows]
 
@@ -241,8 +275,12 @@ def leagues_dag():
 
     @task_group
     def load_league_seasons():
+        # Handles CSV + DB load for LEAGUE_SEASONS
+
         @task
         def league_seasons_to_csv(**context) -> str:
+            # Append-only write to /tmp/league_seasons.csv
+            # Dedupe by (LEAGUE_ID, SEASON_ID)
             import os, csv
             rows = context['ti'].xcom_pull(key='formatted_league_seasons', task_ids='format_leagues')
             path = "/tmp/league_seasons.csv"
@@ -273,6 +311,8 @@ def leagues_dag():
 
         @task
         def league_seasons_to_oracle(**context) -> str:
+            # MERGE-only insert into LEAGUE_SEASONS (skips existing pairs)
+            # Parses START/END as DATE from 'YYYY-MM-DD'
             rows = context['ti'].xcom_pull(key='formatted_league_seasons', task_ids='format_leagues') or []
             rows = [
                 (r["LEAGUE_ID"], r["SEASON_ID"], r.get("START_DATE"), r.get("END_DATE"))
@@ -312,9 +352,10 @@ def leagues_dag():
 
     @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
     def advance_pointers(country_selection: dict, season_selection: dict) -> None:
-        # Season pointer
+        # Advances round-robin indices:
+        #   - Increment season index; if wrapped, increment country index
+        #   - Always moves at least one pointer if upstream partially succeeded
         s_key, s_idx, s_total = season_selection["key"], season_selection["idx"], season_selection["total"]
-        # Country pointer
         c_key, c_idx, c_total = country_selection["key"], country_selection["idx"], country_selection["total"]
 
         next_s = s_idx + 1
@@ -328,17 +369,29 @@ def leagues_dag():
                 next_c = 0
             Variable.set(c_key, str(next_c))
 
-    # DAG wiring
+    # ---------------------------
+    # DAG wiring (dependencies)
+    # ---------------------------
     create_leagues_table()
 
+    # Select (country, season) pair for this run
     country_selection = select_leagues_country(fetch_countries())
     season_selection = select_leagues_season(fetch_seasons())
 
+    # Probe API and branch based on availability of leagues
     payload = is_api_available(country_selection=country_selection, season_selection=season_selection)
     update = advance_pointers(country_selection=country_selection, season_selection=season_selection)
     branch = are_leagues_exist(payload)
 
-    branch >> format_leagues(country_selection=country_selection, season_selection=season_selection) >> load_leagues() >> create_league_seasons_table() >> load_league_seasons() >> update
+    # If data exists: format -> load LEAGUES -> ensure LEAGUE_SEASONS table -> load LEAGUE_SEASONS -> advance pointers
+    branch >> format_leagues(country_selection=country_selection, season_selection=season_selection) \
+           >> load_leagues() \
+           >> create_league_seasons_table() \
+           >> load_league_seasons() \
+           >> update
+
+    # If no data: just advance pointers
     branch >> update
+
 
 leagues_dag()
