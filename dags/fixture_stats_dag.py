@@ -7,9 +7,21 @@ from airflow.utils.trigger_rule import TriggerRule
 
 @dag
 def fixture_stats_dag():
+    """
+    Airflow DAG for ingesting per-team statistics for each fixture.
+    Steps:
+      1) Ensure FIXTURE_TEAM_STATS table exists
+      2) Round-robin select a FIXTURE_ID via Airflow Variable
+      3) Call API /fixtures/statistics for that fixture
+      4) If data -> normalize -> CSV -> Oracle (upsert)
+      5) Advance pointer so next run processes next fixture
+    """
 
     @task.sql(conn_id="oracle_default")
     def create_fixtures_team_stats_table():
+        # Creates FIXTURE_TEAM_STATS if it does not exist (idempotent CREATE block)
+        # Composite PK: (FIXTURE_ID, TEAM_ID)
+        # FKs reference FIXTURES(FIXTURE_ID) and TEAMS(TEAM_ID)
         return """
         DECLARE
           e_exists EXCEPTION;
@@ -48,6 +60,7 @@ def fixture_stats_dag():
 
     @task
     def fetch_fixtures() -> list[dict[str, int]]:
+        # Reads FIXTURE_IDs from FIXTURES; returns [{"FIXTURE_ID": ...}, ...]
         hook = OracleHook(oracle_conn_id="oracle_default")
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
@@ -57,10 +70,12 @@ def fixture_stats_dag():
 
     @task
     def select_fixture(fixtures: list[dict[str, int]]) -> dict[str, int]:
+        # Round-robin pointer over fixture list stored in Airflow Variable
         key = "fixture_stats_fixture_id_indicator"
         idx = int(Variable.get(key, default=0))
         total = len(fixtures)
         if total == 0:
+            # Gracefully handle empty FIXTURES table
             return {"key": key, "idx": 0, "total": 0}
         if idx >= total:
             idx = 0
@@ -68,10 +83,13 @@ def fixture_stats_dag():
 
     @task.sensor(poke_interval=30, timeout=120)
     def is_api_available(fixture_selection: dict) -> PokeReturnValue:
+        # Sensor to check /fixtures/statistics for the selected fixture
+        # Polls every 30s up to 2min; returns JSON payload via XCom on success
         import requests
         log = LoggingMixin().log
         fixture_id = fixture_selection.get("fixture_id")
         if not fixture_id:
+            # If there is no fixture (empty list), proceed with empty response
             return PokeReturnValue(is_done=True, xcom_value={"response": []})
 
         api_key = Variable.get("API_KEY")
@@ -91,6 +109,9 @@ def fixture_stats_dag():
 
     @task.branch
     def are_stats_exist(payload: dict, **context):
+        # Branching:
+        #  - If no stats -> jump to pointer advance (skip formatting/loading)
+        #  - If stats -> push payload to XCom and continue
         data = payload.get("response", []) if payload else []
         if not data:
             return "advance_fixtures_stats_fixture_id_pointer"
@@ -99,18 +120,16 @@ def fixture_stats_dag():
 
     @task
     def format_stats(fixture_selection: dict, **context):
-        """
-        Produces one dict per team:
-        { FIXTURE_ID, TEAM_ID, SHOTS_ON_GOAL, ..., PASSES_PCT }
-        """
+        # Normalizes API payload into two rows (home/away) per fixture:
+        # { FIXTURE_ID, TEAM_ID, SHOTS_ON_GOAL, ..., PASSES_PCT }
         payload = context['ti'].xcom_pull(key='stats_payload', task_ids='are_stats_exist') or []
         fixture_id = fixture_selection["fixture_id"]
 
         def norm(label: str) -> str:
-            # normalize API "type" strings
+            # Normalize API "type" strings into a compact key for mapping
             return (label or "").lower().replace(" ", "").replace("-", "")
 
-        # map normalized labels to Oracle column names
+        # Map normalized labels to Oracle column names
         COLMAP = {
             "shotsongoal":        "SHOTS_ON_GOAL",
             "shotsoffgoal":       "SHOTS_OFF_GOAL",
@@ -131,17 +150,22 @@ def fixture_stats_dag():
         }
 
         def to_number(v):
-            if v is None: return None
-            if isinstance(v, (int, float)): return float(v)
+            # Converts values to float (handles integers, strings with %, etc.)
+            if v is None:
+                return None
+            if isinstance(v, (int, float)):
+                return float(v)
             s = str(v).strip().replace("%", "")
-            try: return float(s)
-            except Exception: return None
+            try:
+                return float(s)
+            except Exception:
+                return None
 
         rows = []
         for team_block in payload:
             team = team_block.get("team") or {}
             team_id = team.get("id")
-            # base row with all columns None
+            # Initialize row with all stats set to None
             row = {
                 "FIXTURE_ID": fixture_id,
                 "TEAM_ID": team_id,
@@ -156,13 +180,17 @@ def fixture_stats_dag():
                     row[col] = to_number(stat.get("value"))
             rows.append(row)
 
+        # Push normalized rows for loaders
         context['ti'].xcom_push(key='fixture_team_stats_rows', value=rows)
-
 
     @task_group
     def load_stats():
+        # TaskGroup: writes stats to CSV and Oracle (upsert)
+
         @task
         def fixture_stats_to_csv(**context) -> str:
+            # Append-only write to /tmp/fixture_team_stats.csv
+            # Dedupe by (FIXTURE_ID, TEAM_ID) using existing file + current batch
             import os, csv
             rows = context['ti'].xcom_pull(key='fixture_team_stats_rows', task_ids='format_stats') or []
             path = "/tmp/fixture_team_stats.csv"
@@ -198,9 +226,11 @@ def fixture_stats_dag():
 
         @task
         def fixture_stats_to_oracle(**context) -> str:
+            # Upsert into FIXTURE_TEAM_STATS via MERGE:
+            #  - MATCHED   -> UPDATE all stats
+            #  - NOT MATCH -> INSERT
+
             rows = context['ti'].xcom_pull(key='fixture_team_stats_rows', task_ids='format_stats') or []
-            if not rows:
-                return "No rows to upsert."
 
             sql = """
             MERGE INTO FIXTURE_TEAM_STATS t
@@ -243,8 +273,10 @@ def fixture_stats_dag():
               s.SHOTS_INSIDE_BOX, s.SHOTS_OUTSIDE_BOX, s.FOULS, s.CORNER_KICKS, s.OFFSIDES,
               s.BALL_POSSESSION_PCT, s.YELLOW_CARDS, s.RED_CARDS, s.GOALKEEPER_SAVES,
               s.TOTAL_PASSES, s.PASSES_ACCURATE, s.PASSES_PCT
-            ) WHERE EXISTS (SELECT 1 FROM FIXTURE_TEAM_STATS f WHERE f.TEAM_ID = s.TEAM_ID)
+            ) WHERE EXISTS (SELECT 1 FROM FIXTURES f WHERE f.FIXTURE_ID = s.FIXTURE_ID)
+                AND EXISTS (SELECT 1 FROM TEAMS t WHERE t.TEAM_ID = s.TEAM_ID)
             """
+
             bind_rows = [
                 (
                     r["FIXTURE_ID"], r["TEAM_ID"],
@@ -253,7 +285,7 @@ def fixture_stats_dag():
                     r["BALL_POSSESSION_PCT"], r["YELLOW_CARDS"], r["RED_CARDS"], r["GOALKEEPER_SAVES"],
                     r["TOTAL_PASSES"], r["PASSES_ACCURATE"], r["PASSES_PCT"]
                 )
-                for r in rows if r.get("FIXTURE_ID") and r.get("TEAM_ID")
+                for r in rows
             ]
 
             hook = OracleHook(oracle_conn_id="oracle_default")
@@ -268,19 +300,24 @@ def fixture_stats_dag():
 
     @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
     def advance_fixtures_stats_fixture_id_pointer(fixture_selection: dict) -> None:
+        # Advances round-robin pointer over fixtures
+      
         f_key, f_idx, f_total = fixture_selection["key"], fixture_selection["idx"], fixture_selection["total"]
         next_f = f_idx + 1
-        if next_f < f_total:
-            next_f = 0
+        if next_f >= f_total:
+            next_f = 0  
         Variable.set(f_key, str(next_f))
 
+    # DAG wiring (task dependencies)
     create_fixtures_team_stats_table()
     fixture_sel = select_fixture(fetch_fixtures())
     payload = is_api_available(fixture_selection=fixture_sel)
     branch = are_stats_exist(payload)
     update = advance_fixtures_stats_fixture_id_pointer(fixture_selection=fixture_sel)
 
+    # If data exists: format -> load -> advance pointer
     branch >> format_stats(fixture_selection=fixture_sel) >> load_stats() >> update
+    # If no data: advance pointer directly
     branch >> update
 
 

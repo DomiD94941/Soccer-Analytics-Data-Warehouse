@@ -1,56 +1,60 @@
 from datetime import timedelta
-from airflow.sdk import dag, Variable
+from airflow.sdk import task, dag, Variable
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sensors.time_delta import TimeDeltaSensorAsync
 from airflow.operators.empty import EmptyOperator
-from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 
-# Configurable limit (default 19). Change in UI if needed.
+# Orchestrator configuration
+
+# Persistent counters kept in Airflow Variables so logic survives scheduler restarts.
+# VAR_COUNT: how many times we've executed the "first run path" successfully.
+# VAR_LIMIT: how many times we should take the first run path before switching to fast path.
 VAR_COUNT = "orchestrator_first_runs_count"
 VAR_LIMIT = "orchestrator_first_runs_limit"
 
 def _get_count() -> int:
+    # Current number of completed first-run cycles
     return int(Variable.get(VAR_COUNT, default=0))
 
 def _get_limit() -> int:
+    # Threshold after which we stop running the heavy bootstrap path
     return int(Variable.get(VAR_LIMIT, default=19))
 
-def _choose_path() -> str:
-    # If we've done the full path fewer than LIMIT times, do it again.
-    return "first_run_path" if _get_count() < _get_limit() else "fast_path"
-
-def _inc_count():
-    # Increase counter after a successful full-path execution
-    Variable.set(VAR_COUNT, str(_get_count() + 1))
-
 @dag(
-    schedule="*/5 * * * *",     # every 5 minutes (optional; keep if you want it scheduled)
-    catchup=False,
-    max_active_runs=1,          # important so the counter doesn't race
+    schedule="*/5 * * * *",   # Run every 5 minutes (optional—tune as needed)
+    catchup=False,            # Do not backfill historical runs
+    max_active_runs=1,        # Prevent concurrent runs to avoid counter races
     tags=["orchestrator"],
 )
 def orchestrator_dag():
-    # Branch: choose “first_run_path” for the first 19 runs, else “fast_path”
-    choose_path = BranchPythonOperator(
-        task_id="choose_path",
-        python_callable=_choose_path,
-    )
+    # Decide which branch to take:
+    # - For the first N (default 19) executions -> "first_run_path" (bootstraps foundational data)
+    # - Afterwards -> "fast_path" (skip the heavy bootstrap)
+    @task.branch
+    def choose_path():
+        return "first_run_path" if _get_count() < _get_limit() else "fast_path"
 
+    # Branch heads (used purely for graph readability and branching)
     first_run_path = EmptyOperator(task_id="first_run_path")
     fast_path = EmptyOperator(task_id="fast_path")
 
-    # --- first-run-only tasks (counted) ---
+    
+    # First-run-only section (counted)
+   
+    # Run SEASONS DAG (blocks until completion). Using deferrable operator to save scheduler resources.
     run_seasons = TriggerDagRunOperator(
         task_id="run_seasons",
         trigger_dag_id="seasons_dag",
         wait_for_completion=True,
         deferrable=True,
-        conf={"orchestrator_run_id": "{{ run_id }}"},
+        conf={"orchestrator_run_id": "{{ run_id }}"},  # propagate orchestrator run id for traceability
         poke_interval=60,
     )
+    # Small cooldown to allow downstream systems to stabilize
     gap_after_seasons = TimeDeltaSensorAsync(task_id="gap_after_seasons", delta=timedelta(minutes=2))
 
+    # Run COUNTRIES DAG (also deferrable + blocking)
     run_countries = TriggerDagRunOperator(
         task_id="run_countries",
         trigger_dag_id="countries_dag",
@@ -60,20 +64,22 @@ def orchestrator_dag():
     )
     gap_after_countries = TimeDeltaSensorAsync(task_id="gap_after_countries", delta=timedelta(minutes=2))
 
-    # Increment the counter ONLY when the full path has actually completed successfully
-    inc_full_path_counter = PythonOperator(
-        task_id="inc_full_path_counter",
-        python_callable=_inc_count,
-        trigger_rule=TriggerRule.ALL_SUCCESS,  # require both gaps to succeed
-    )
+    # Only increment the first-run counter when BOTH streams (seasons + countries) fully succeed
+    @task(TriggerRule.ALL_SUCCESS)
+    def inc_full_path_counter():
+        Variable.set(VAR_COUNT, str(_get_count() + 1))
 
-    # Join node so either branch can proceed
+    # Join node so either branch (first/fast) can converge before the common tail
     start_venues = EmptyOperator(
         task_id="start_venues",
-        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,  # be tolerant to partial upstream branches
     )
 
-    # --- always-run tail ---
+    
+    # Always-run tail (executed on every orchestrator run)
+  
+    # Venues -> Leagues -> Teams -> Fixtures -> Fixture Stats
+    # Each step triggers a separate DAG and waits for it to finish
     run_venues = TriggerDagRunOperator(
         task_id="run_venues",
         trigger_dag_id="venues_dag",
@@ -118,20 +124,26 @@ def orchestrator_dag():
         conf={"orchestrator_run_id": "{{ run_id }}"},
     )
 
-    # Wiring
+    
+    # Wiring (task dependencies)
+
+    # Branch to either first-run or fast path
     choose_path >> [first_run_path, fast_path]
 
-    # Full path (counted): seasons + countries, then bump counter, then join
+    # Full bootstrap path: run seasons + countries in parallel, then bump counter, then join
     first_run_path >> run_seasons >> gap_after_seasons
     first_run_path >> run_countries >> gap_after_countries
     [gap_after_seasons, gap_after_countries] >> inc_full_path_counter >> start_venues
 
-    # Fast path (20th+ run): jump straight to venues
+    # Fast path: skip bootstrap and jump straight to venues
     fast_path >> start_venues
 
-    # Common tail
-    start_venues >> run_venues >> gap_after_venues >> run_leagues >> gap_after_leagues \
-        >> run_teams >> gap_after_teams >> run_fixtures >> gap_after_fixtures \
+    # Common tail executed on every run (sequential with gaps between)
+    start_venues >> run_venues >> gap_after_venues \
+        >> run_leagues >> gap_after_leagues \
+        >> run_teams >> gap_after_teams \
+        >> run_fixtures >> gap_after_fixtures \
         >> run_fixture_stats
+
 
 orchestrator_dag()

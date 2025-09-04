@@ -155,8 +155,10 @@ def seasons_dag():
 
         @task
         def seasons_to_oracle(formatted_seasons: list[dict[str, int]]) -> str:
+            
             # Inserts seasons into Oracle SEASONS table
             # MERGE ensures duplicates are skipped
+
             sql = """
                 MERGE INTO SEASONS t
                 USING (

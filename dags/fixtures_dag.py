@@ -272,9 +272,11 @@ def fixtures_dag():
 
         @task
         def fixtures_to_oracle(**context) -> str:
+            
             # MERGE-only insert into FIXTURES (skips existing by FIXTURE_ID)
             # Enforces referential integrity via WHERE EXISTS checks
-            rows = context['ti'].xcom_pull(key='formatted_fixtures', task_ids='format_fixtures') or []
+
+            formatted = context['ti'].xcom_pull(key='formatted_fixtures', task_ids='format_fixtures') or []
             rows = [
                 (
                     r["FIXTURE_ID"], r["REFEREE"], r["TZ"], r["KICKOFF_UTC"],
@@ -285,10 +287,8 @@ def fixtures_dag():
                     r["ET_HOME"], r["ET_AWAY"], r["PEN_HOME"], r["PEN_AWAY"],
                     r["VENUE_ID"], r["LEAGUE_ID"], r["SEASON_ID"]
                 )
-                for r in rows if r.get("FIXTURE_ID") is not None
+                for r in formatted
             ]
-            if not rows:
-                return "No rows to insert."
 
             sql = """
             MERGE INTO FIXTURES f

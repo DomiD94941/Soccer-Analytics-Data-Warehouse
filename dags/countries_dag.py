@@ -135,8 +135,10 @@ def countries_dag():
 
         @task
         def countries_to_oracle(formatted_countries: list[dict[str, str]]) -> str:
+
             # Inserts countries into Oracle DB using MERGE
             # Skips rows if COUNTRY_NAME already exists
+            
             sql = """
                 MERGE INTO COUNTRIES t
                 USING (

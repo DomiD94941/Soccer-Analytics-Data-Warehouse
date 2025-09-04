@@ -6,9 +6,20 @@ from airflow.utils.trigger_rule import TriggerRule
 
 @dag
 def teams_dag():
+    """
+    Airflow DAG for ingesting teams for each (season, league).
+    Flow:
+      1) Ensure TEAMS table exists
+      2) Select season (outer pointer) and league (inner pointer)
+      3) Call API /teams?league=&season=
+      4) If data -> format -> CSV -> Oracle
+      5) Advance pointers to cover all combinations over time
+    """
 
     @task.sql(conn_id="oracle_default")
     def create_teams_table():
+        # Creates TEAMS table if missing (idempotent)
+        # Foreign keys reference LEAGUES, SEASONS, and VENUES
         return """
         DECLARE
           e_exists EXCEPTION;
@@ -36,8 +47,10 @@ def teams_dag():
           WHEN e_exists THEN NULL;
         END;
         """
+
     @task
     def fetch_seasons() -> list[dict[str, int]]:
+        # Read seasons from SEASONS table; provide SEASON_ID + SEASON_YEAR
         hook = OracleHook(oracle_conn_id="oracle_default")
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
@@ -47,9 +60,7 @@ def teams_dag():
     
     @task
     def select_teams_season(seasons: list[dict[str, int]]) -> dict[str, int]:
-        """
-        Outer pointer: seasons
-        """
+        # Outer pointer: chooses the current season index from Airflow Variable
         season_id_indicator = "teams_season_id_indicator"
         idx = int(Variable.get(season_id_indicator, default=0))
         total = len(seasons)
@@ -65,9 +76,7 @@ def teams_dag():
     
     @task
     def fetch_leagues() -> list[dict[str, int | str]]:
-        """
-        Inner domain for the selected season: all leagues recorded for that SEASON_ID.
-        """
+        # Read all leagues (across seasons) from LEAGUES; filtered at API step by season param
         hook = OracleHook(oracle_conn_id="oracle_default")
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
@@ -77,14 +86,12 @@ def teams_dag():
     
     @task
     def select_teams_league(leagues: list[dict[str, int | str]]) -> dict[str, int | str]:
-        """
-        Inner pointer: leagues (for the current season).
-        """
+        # Inner pointer: chooses current league index from Airflow Variable
         league_id_indicator = "teams_league_id_indicator"
         idx = int(Variable.get(league_id_indicator, default=0))
         total = len(leagues)
         if total == 0:
-            # No leagues for this season; return an empty selection but keep the pointer info.
+            # No leagues recorded yet; keep pointer info but empty selection
             return {"key": league_id_indicator, "idx": 0, "total": 0}
         if idx >= total:
             idx = 0
@@ -98,6 +105,8 @@ def teams_dag():
     
     @task.sensor(poke_interval=30, timeout=120)
     def is_api_available(season_selection: dict, league_selection: dict) -> PokeReturnValue:
+        # Sensor: checks /teams endpoint for (league, season)
+        # Polls every 30s up to 2min; returns payload via XCom on success
         import requests
         log = LoggingMixin().log
 
@@ -125,28 +134,29 @@ def teams_dag():
     
     @task.branch
     def are_teams_exist(payload: dict, **context):
+        # Branching:
+        #  - If no teams -> advance pointers
+        #  - If teams exist -> continue to formatting and loading
         log = LoggingMixin().log
         teams = payload.get("response", [])
         if not teams:
             log.warning("No teams found in API response.")
-            return "advance_teams_league_id_pointer"
+            return "advance_pointers"
         log.info("Found %d teams", len(teams))
         context['ti'].xcom_push(key='available_teams', value=teams)
         return "format_teams"
 
     @task
     def format_teams(league_selection: dict, season_selection: dict, **context) -> list[dict]:
-        """
-        Build rows for TEAMS:
-        TEAM_ID, TEAM_NAME, TEAM_CODE, TEAM_COUNTRY, FOUNDED, NATIONAL, VENUE_ID
-        """
+        # Transform API payload into TEAMS rows:
+        # TEAM_ID, TEAM_NAME, TEAM_CODE, TEAM_COUNTRY, FOUNDED, NATIONAL, VENUE_ID, LEAGUE_ID, SEASON_ID
         available_teams = context['ti'].xcom_pull(key='available_teams', task_ids='are_teams_exist')
         league_id = league_selection["league_id"]
         season_id = season_selection["season_id"]
         formatted: list[dict] = []
         for entry in available_teams:
-            t = entry.get("team")
-            v = entry.get("venue")
+            t = entry.get("team") or {}
+            v = entry.get("venue") or {}
             formatted.append({
                 "TEAM_ID": t.get("id"),
                 "TEAM_NAME": t.get("name"),
@@ -162,12 +172,15 @@ def teams_dag():
 
     @task_group
     def load_teams():
+        # TaskGroup: write teams to CSV and Oracle
+
         @task
         def teams_to_csv(**context) -> str:
+            # Append-only writer to /tmp/teams.csv; dedupe by TEAM_ID
             import os, csv
-            rows = context['ti'].xcom_pull(key='formatted_teams', task_ids='format_teams')
+            rows = context['ti'].xcom_pull(key='formatted_teams', task_ids='format_teams') or []
             path = "/tmp/teams.csv"
-            fieldnames = ["TEAM_ID","TEAM_NAME","TEAM_CODE","TEAM_COUNTRY","FOUNDED","NATIONAL", "LEAGUE_ID", "SEASON_ID", "VENUE_ID"]
+            fieldnames = ["TEAM_ID","TEAM_NAME","TEAM_CODE","TEAM_COUNTRY","FOUNDED","NATIONAL","LEAGUE_ID","SEASON_ID","VENUE_ID"]
 
             existing = set()
             if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -193,13 +206,12 @@ def teams_dag():
 
         @task
         def teams_to_oracle(**context) -> str:
-            rows = context['ti'].xcom_pull(key='formatted_teams', task_ids='format_teams') or []
+            # MERGE-only insert into TEAMS (skip existing TEAM_ID)
+            formatted = context['ti'].xcom_pull(key='formatted_teams', task_ids='format_teams') or []
             rows = [
                 (r["TEAM_ID"], r["TEAM_NAME"], r["TEAM_CODE"], r["TEAM_COUNTRY"], r["FOUNDED"], r["NATIONAL"], r["LEAGUE_ID"], r["SEASON_ID"], r["VENUE_ID"])
-                for r in rows if r.get("TEAM_ID") is not None
+                for r in formatted
             ]
-            if not rows:
-                return "No rows to insert."
 
             sql = """
             MERGE INTO TEAMS t
@@ -221,8 +233,8 @@ def teams_dag():
             ) VALUES (
               s.TEAM_ID, s.TEAM_NAME, s.TEAM_CODE, s.TEAM_COUNTRY, s.FOUNDED, s.NATIONAL, s.LEAGUE_ID, s.SEASON_ID, s.VENUE_ID
             ) WHERE EXISTS (SELECT 1 FROM LEAGUES l WHERE l.LEAGUE_ID = s.LEAGUE_ID)
-            AND EXISTS (SELECT 1 FROM SEASONS se WHERE se.SEASON_ID = s.SEASON_ID)
-            AND EXISTS (SELECT 1 FROM VENUES v WHERE v.VENUE_ID = s.VENUE_ID)
+              AND EXISTS (SELECT 1 FROM SEASONS se WHERE se.SEASON_ID = s.SEASON_ID)
+              AND EXISTS (SELECT 1 FROM VENUES v WHERE v.VENUE_ID = s.VENUE_ID)
             """
 
             hook = OracleHook(oracle_conn_id="oracle_default")
@@ -237,33 +249,39 @@ def teams_dag():
 
     @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
     def advance_pointers(season_selection: dict, league_selection: dict) -> None:
-        # Season pointer
+        # Advances round-robin indices:
+        #  - Increment season index; if wrapped, increment league index
         s_key, s_idx, s_total = season_selection["key"], season_selection["idx"], season_selection["total"]
-        # League pointer
         l_key, l_idx, l_total = league_selection["key"], league_selection.get("idx", 0), league_selection.get("total", 0)
 
         next_s = s_idx + 1
         if next_s < s_total:
+            # Move to next season; keep league pointer
             Variable.set(s_key, str(next_s))
             Variable.set(l_key, str(l_idx))
         else:
+            # Wrap seasons to 0; advance league (wrap if needed)
             Variable.set(s_key, "0")
             next_l = l_idx + 1
             if next_l >= l_total:
                 next_l = 0
             Variable.set(l_key, str(next_l))
 
-    # DAG wiring
+    # DAG wiring (task dependencies)
     create_teams_table()
 
+    # Select (season, league) pair for this run
     league_selection = select_teams_league(fetch_leagues())
     season_selection = select_teams_season(fetch_seasons())
 
+    # Probe API and branch
     payload = is_api_available(league_selection=league_selection, season_selection=season_selection)
     update = advance_pointers(league_selection=league_selection, season_selection=season_selection)
     branch = are_teams_exist(payload)
 
+    # If data exists: format -> load -> advance pointers
     branch >> format_teams(league_selection=league_selection, season_selection=season_selection) >> load_teams() >> update
+    # If no data: advance pointers directly
     branch >> update
 
 

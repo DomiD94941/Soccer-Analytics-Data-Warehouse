@@ -313,14 +313,11 @@ def leagues_dag():
         def league_seasons_to_oracle(**context) -> str:
             # MERGE-only insert into LEAGUE_SEASONS (skips existing pairs)
             # Parses START/END as DATE from 'YYYY-MM-DD'
-            rows = context['ti'].xcom_pull(key='formatted_league_seasons', task_ids='format_leagues') or []
+            formatted = context['ti'].xcom_pull(key='formatted_league_seasons', task_ids='format_leagues') or []
             rows = [
                 (r["LEAGUE_ID"], r["SEASON_ID"], r.get("START_DATE"), r.get("END_DATE"))
-                for r in rows
-                if r.get("LEAGUE_ID") is not None and r.get("SEASON_ID") is not None
+                for r in formatted
             ]
-            if not rows:
-                return "No league-season rows to insert."
 
             sql = """
             MERGE INTO LEAGUE_SEASONS ls

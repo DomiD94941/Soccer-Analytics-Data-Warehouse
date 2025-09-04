@@ -183,11 +183,7 @@ def venues_dag():
             formatted = context['ti'].xcom_pull(key='formatted_venues', task_ids='format_venues')
             rows = [
                 (r["VENUE_ID"], r["VENUE_NAME"], r["ADDRESS"], r["CITY"], r["COUNTRY_ID"], r["CAPACITY"], r["SURFACE"])
-                for r in formatted if r.get("VENUE_ID") is not None
-            ]
-
-            if not rows:
-                return "No rows to insert."
+                for r in formatted]
 
             sql = """
             MERGE INTO VENUES v
