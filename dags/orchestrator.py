@@ -6,28 +6,41 @@ from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 
-VAR_NAME = "orchestrator_first_run_done"
+# Configurable limit (default 19). Change in UI if needed.
+VAR_COUNT = "orchestrator_first_runs_count"
+VAR_LIMIT = "orchestrator_first_runs_limit"
 
-def is_first_run() -> bool:
-    return Variable.get(VAR_NAME, default_var="false").lower() != "true"
+def _get_count() -> int:
+    return int(Variable.get(VAR_COUNT, default=0))
 
-def mark_first_run_done():
-    Variable.set(VAR_NAME, "true")
+def _get_limit() -> int:
+    return int(Variable.get(VAR_LIMIT, default=19))
 
-@dag(schedule=None, catchup=False, tags=["orchestrator"])
+def _choose_path() -> str:
+    # If we've done the full path fewer than LIMIT times, do it again.
+    return "first_run_path" if _get_count() < _get_limit() else "fast_path"
+
+def _inc_count():
+    # Increase counter after a successful full-path execution
+    Variable.set(VAR_COUNT, str(_get_count() + 1))
+
+@dag(
+    schedule="*/5 * * * *",     # every 5 minutes (optional; keep if you want it scheduled)
+    catchup=False,
+    max_active_runs=1,          # important so the counter doesn't race
+    tags=["orchestrator"],
+)
 def orchestrator_dag():
-
-    # Decide which path to take
+    # Branch: choose “first_run_path” for the first 19 runs, else “fast_path”
     choose_path = BranchPythonOperator(
         task_id="choose_path",
-        python_callable=lambda: "first_run_path" if is_first_run() else "fast_path",
+        python_callable=_choose_path,
     )
 
-    # Branch heads (simple dummies)
     first_run_path = EmptyOperator(task_id="first_run_path")
     fast_path = EmptyOperator(task_id="fast_path")
 
-    # First-run-only tasks
+    # --- first-run-only tasks (counted) ---
     run_seasons = TriggerDagRunOperator(
         task_id="run_seasons",
         trigger_dag_id="seasons_dag",
@@ -47,13 +60,20 @@ def orchestrator_dag():
     )
     gap_after_countries = TimeDeltaSensorAsync(task_id="gap_after_countries", delta=timedelta(minutes=2))
 
-    # Join node: proceed after either branch unblocks
+    # Increment the counter ONLY when the full path has actually completed successfully
+    inc_full_path_counter = PythonOperator(
+        task_id="inc_full_path_counter",
+        python_callable=_inc_count,
+        trigger_rule=TriggerRule.ALL_SUCCESS,  # require both gaps to succeed
+    )
+
+    # Join node so either branch can proceed
     start_venues = EmptyOperator(
         task_id="start_venues",
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
-    # Always-run pipeline
+    # --- always-run tail ---
     run_venues = TriggerDagRunOperator(
         task_id="run_venues",
         trigger_dag_id="venues_dag",
@@ -98,26 +118,20 @@ def orchestrator_dag():
         conf={"orchestrator_run_id": "{{ run_id }}"},
     )
 
-    mark_done = PythonOperator(
-        task_id="mark_first_run_done",
-        python_callable=mark_first_run_done,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-
     # Wiring
     choose_path >> [first_run_path, fast_path]
 
-    # First-run path
+    # Full path (counted): seasons + countries, then bump counter, then join
     first_run_path >> run_seasons >> gap_after_seasons
     first_run_path >> run_countries >> gap_after_countries
-    [gap_after_seasons, gap_after_countries] >> start_venues
+    [gap_after_seasons, gap_after_countries] >> inc_full_path_counter >> start_venues
 
-    # Fast path
+    # Fast path (20th+ run): jump straight to venues
     fast_path >> start_venues
 
     # Common tail
     start_venues >> run_venues >> gap_after_venues >> run_leagues >> gap_after_leagues \
         >> run_teams >> gap_after_teams >> run_fixtures >> gap_after_fixtures \
-        >> run_fixture_stats >> mark_done
+        >> run_fixture_stats
 
 orchestrator_dag()
