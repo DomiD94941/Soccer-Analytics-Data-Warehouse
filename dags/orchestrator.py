@@ -1,7 +1,7 @@
 from datetime import timedelta
 from airflow.sdk import task, dag, Variable
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from airflow.sensors.time_delta import TimeDeltaSensorAsync
+from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.trigger_rule import TriggerRule
 
@@ -25,7 +25,7 @@ def _get_limit() -> int:
     schedule="*/5 * * * *",   # Run every 5 minutes (optional—tune as needed)
     catchup=False,            # Do not backfill historical runs
     max_active_runs=1,        # Prevent concurrent runs to avoid counter races
-    tags=["orchestrator"],
+    tags=["orchestrator"]
 )
 def orchestrator_dag():
     # Decide which branch to take:
@@ -46,94 +46,81 @@ def orchestrator_dag():
     run_seasons = TriggerDagRunOperator(
         task_id="run_seasons",
         trigger_dag_id="seasons_dag",
-        wait_for_completion=True,
-        deferrable=True,
-        conf={"orchestrator_run_id": "{{ run_id }}"},  # propagate orchestrator run id for traceability
-        poke_interval=60,
+        conf={"orchestrator_run_id": "{{ run_id }}"} # propagate orchestrator run id for traceability
     )
-    # Small cooldown to allow downstream systems to stabilize
-    gap_after_seasons = TimeDeltaSensorAsync(task_id="gap_after_seasons", delta=timedelta(minutes=2))
 
     # Run COUNTRIES DAG (also deferrable + blocking)
     run_countries = TriggerDagRunOperator(
         task_id="run_countries",
         trigger_dag_id="countries_dag",
-        wait_for_completion=True,
-        deferrable=True,
-        conf={"orchestrator_run_id": "{{ run_id }}"},
+        conf={"orchestrator_run_id": "{{ run_id }}"}
     )
-    gap_after_countries = TimeDeltaSensorAsync(task_id="gap_after_countries", delta=timedelta(minutes=2))
 
     # Only increment the first-run counter when BOTH streams (seasons + countries) fully succeed
-    @task(TriggerRule.ALL_SUCCESS)
+    @task(trigger_rule=TriggerRule.ALL_SUCCESS)
     def inc_full_path_counter():
         Variable.set(VAR_COUNT, str(_get_count() + 1))
 
     # Join node so either branch (first/fast) can converge before the common tail
     start_venues = EmptyOperator(
         task_id="start_venues",
-        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,  # be tolerant to partial upstream branches
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS # be tolerant to partial upstream branches
     )
 
     
     # Always-run tail (executed on every orchestrator run)
   
     # Venues -> Leagues -> Teams -> Fixtures -> Fixture Stats
-    # Each step triggers a separate DAG and waits for it to finish
+    
     run_venues = TriggerDagRunOperator(
         task_id="run_venues",
         trigger_dag_id="venues_dag",
-        wait_for_completion=True,
-        deferrable=True,
-        conf={"orchestrator_run_id": "{{ run_id }}"},
+        conf={"orchestrator_run_id": "{{ run_id }}"}
     )
-    gap_after_venues = TimeDeltaSensorAsync(task_id="gap_after_venues", delta=timedelta(minutes=5))
 
     run_leagues = TriggerDagRunOperator(
         task_id="run_leagues",
         trigger_dag_id="leagues_dag",
-        wait_for_completion=True,
-        deferrable=True,
-        conf={"orchestrator_run_id": "{{ run_id }}"},
+        conf={"orchestrator_run_id": "{{ run_id }}"}
     )
-    gap_after_leagues = TimeDeltaSensorAsync(task_id="gap_after_leagues", delta=timedelta(minutes=3))
 
     run_teams = TriggerDagRunOperator(
         task_id="run_teams",
         trigger_dag_id="teams_dag",
-        wait_for_completion=True,
-        deferrable=True,
-        conf={"orchestrator_run_id": "{{ run_id }}"},
+        conf={"orchestrator_run_id": "{{ run_id }}"}
     )
-    gap_after_teams = TimeDeltaSensorAsync(task_id="gap_after_teams", delta=timedelta(minutes=3))
 
     run_fixtures = TriggerDagRunOperator(
         task_id="run_fixtures",
         trigger_dag_id="fixtures_dag",
-        wait_for_completion=True,
-        deferrable=True,
-        conf={"orchestrator_run_id": "{{ run_id }}"},
+        conf={"orchestrator_run_id": "{{ run_id }}"}
     )
-    gap_after_fixtures = TimeDeltaSensorAsync(task_id="gap_after_fixtures", delta=timedelta(minutes=5))
 
     run_fixture_stats = TriggerDagRunOperator(
         task_id="run_fixture_stats",
         trigger_dag_id="fixture_stats_dag",
-        wait_for_completion=True,
-        deferrable=True,
-        conf={"orchestrator_run_id": "{{ run_id }}"},
+        conf={"orchestrator_run_id": "{{ run_id }}"}
     )
 
-    
+    gap_after_seasons = BashOperator(task_id="gap_after_seasons", bash_command="sleep 60")
+    gap_after_countries = BashOperator(task_id="gap_after_countries", bash_command="sleep 60")
+    gap_after_venues = BashOperator(task_id="gap_after_venues", bash_command="sleep 60")
+    gap_after_leagues = BashOperator(task_id="gap_after_leagues", bash_command="sleep 60")
+    gap_after_teams = BashOperator(task_id="gap_after_teams", bash_command="sleep 60")
+    gap_after_fixtures = BashOperator(task_id="gap_after_fixtures", bash_command="sleep 60")
+
     # Wiring (task dependencies)
 
     # Branch to either first-run or fast path
-    choose_path >> [first_run_path, fast_path]
+    branch_choice = choose_path()
+    incr_counter_task = inc_full_path_counter()
+
+    branch_choice >> [first_run_path, fast_path]
 
     # Full bootstrap path: run seasons + countries in parallel, then bump counter, then join
     first_run_path >> run_seasons >> gap_after_seasons
     first_run_path >> run_countries >> gap_after_countries
-    [gap_after_seasons, gap_after_countries] >> inc_full_path_counter >> start_venues
+    [gap_after_seasons, gap_after_countries] >> incr_counter_task >> start_venues
 
     # Fast path: skip bootstrap and jump straight to venues
     fast_path >> start_venues
