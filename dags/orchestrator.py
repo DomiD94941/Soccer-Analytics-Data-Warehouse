@@ -79,14 +79,14 @@ def football_orchestrator():
     # --- First-run-only section (executed only once, at the very beginning) ---
     run_seasons = TriggerDagRunOperator(
         task_id="run_seasons",
-        trigger_dag_id="seasons_dag",
+        trigger_dag_id="football_seasons_sync",
         conf={"orchestrator_run_id": "{{ run_id }}"},  # propagate orchestrator run id for traceability
         wait_for_completion=True,  # block until target DAG finishes
         deferrable=True,           # save scheduler resources while waiting
     )
     run_countries = TriggerDagRunOperator(
         task_id="run_countries",
-        trigger_dag_id="countries_dag",
+        trigger_dag_id="football_countries_sync",
         conf={"orchestrator_run_id": "{{ run_id }}"},
         wait_for_completion=True,
         deferrable=True,
@@ -106,35 +106,35 @@ def football_orchestrator():
     # --- Always-run tail (executed on every orchestrator run if daily quota allows) ---
     run_venues = TriggerDagRunOperator(
         task_id="run_venues",
-        trigger_dag_id="venues_dag",
+        trigger_dag_id="football_venues_sync",
         conf={"orchestrator_run_id": "{{ run_id }}"},
         wait_for_completion=True,
         deferrable=True,
     )
     run_leagues = TriggerDagRunOperator(
         task_id="run_leagues",
-        trigger_dag_id="leagues_dag",
+        trigger_dag_id="football_leagues_sync",
         conf={"orchestrator_run_id": "{{ run_id }}"},
         wait_for_completion=True,
         deferrable=True,
     )
     run_teams = TriggerDagRunOperator(
         task_id="run_teams",
-        trigger_dag_id="teams_dag",
+        trigger_dag_id="football_teams_sync",
         conf={"orchestrator_run_id": "{{ run_id }}"},
         wait_for_completion=True,
         deferrable=True,
     )
     run_fixtures = TriggerDagRunOperator(
         task_id="run_fixtures",
-        trigger_dag_id="fixtures_dag",
+        trigger_dag_id="football_fixtures_sync",
         conf={"orchestrator_run_id": "{{ run_id }}"},
         wait_for_completion=True,
         deferrable=True,
     )
     run_fixture_stats = TriggerDagRunOperator(
         task_id="run_fixture_stats",
-        trigger_dag_id="fixture_stats_dag",
+        trigger_dag_id="football_fixture_team_stats_sync",
         conf={"orchestrator_run_id": "{{ run_id }}"},
         wait_for_completion=True,
         deferrable=True,
