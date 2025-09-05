@@ -5,8 +5,12 @@ from airflow.providers.oracle.hooks.oracle import OracleHook
 from airflow.utils.trigger_rule import TriggerRule
 
 
-@dag
-def venues_dag():
+@dag(
+    description="Round-robin ingest of venues by country from Football API into Oracle + CSV.",
+    catchup=False,
+    tags=["football", "oracle", "venues"]
+)
+def football_venues_sync():
     """
     Airflow DAG for loading venues into Oracle.
     Steps:
@@ -235,4 +239,4 @@ def venues_dag():
     branch >> update
 
 
-venues_dag()
+football_venues_sync()

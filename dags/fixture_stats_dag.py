@@ -5,8 +5,12 @@ from airflow.providers.oracle.hooks.oracle import OracleHook
 from airflow.utils.trigger_rule import TriggerRule
 
 
-@dag
-def fixture_stats_dag():
+@dag(
+    description="Round-robin ingest of per-team fixture statistics from Football API into Oracle + CSV.",
+    catchup=False,
+    tags=["football", "oracle", "fixtures_stats"]
+)
+def football_fixture_team_stats_sync():
     """
     Airflow DAG for ingesting per-team statistics for each fixture.
     Steps:
@@ -320,5 +324,4 @@ def fixture_stats_dag():
     # If no data: advance pointer directly
     branch >> update
 
-
-fixture_stats_dag()
+football_fixture_team_stats_sync()

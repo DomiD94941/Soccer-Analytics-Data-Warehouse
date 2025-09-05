@@ -4,8 +4,12 @@ from airflow.sensors.base import PokeReturnValue
 from airflow.providers.oracle.hooks.oracle import OracleHook
 from airflow.utils.trigger_rule import TriggerRule
 
-@dag
-def teams_dag():
+@dag(
+    description="Round-robin ingest of teams for each (season, league) into Oracle + CSV.",
+    catchup=False,
+    tags=["football", "oracle", "teams"]   
+)
+def football_teams_sync():
     """
     Airflow DAG for ingesting teams for each (season, league).
     Flow:
@@ -285,4 +289,4 @@ def teams_dag():
     branch >> update
 
 
-teams_dag()
+football_teams_sync()

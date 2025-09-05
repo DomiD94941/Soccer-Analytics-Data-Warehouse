@@ -4,8 +4,12 @@ from airflow.sensors.base import PokeReturnValue
 from airflow.providers.oracle.hooks.oracle import OracleHook
 
 
-@dag
-def seasons_dag():
+@dag(
+    description="Load seasons from Football API into Oracle + CSV (free/paid aware).",
+    catchup=False,
+    tags=["football", "oracle", "seasons"]
+)
+def football_seasons_sync():
     """
     Airflow DAG for loading football seasons into Oracle.
     Steps:
@@ -195,4 +199,4 @@ def seasons_dag():
     branch >> load_seasons(format_seasons_paid_plan(available_seasons))
 
 
-seasons_dag()
+football_seasons_sync()

@@ -4,8 +4,12 @@ from airflow.sensors.base import PokeReturnValue
 from airflow.providers.oracle.hooks.oracle import OracleHook
 
 
-@dag
-def countries_dag():
+@dag(
+    description="Load countries metadata from Football API to Oracle and CSV",
+    catchup=False,
+    tags=["football", "oracle", "countries"]
+)
+def football_countries_sync():
     """
     Airflow DAG for loading countries metadata into Oracle.
     Steps:
@@ -176,4 +180,4 @@ def countries_dag():
 
 
 # Instantiate DAG
-countries_dag()
+football_countries_sync()
