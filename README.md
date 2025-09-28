@@ -45,3 +45,11 @@ docker exec -it soccer-analytics-data-warehouse-airflow-scheduler-1 /bin/bash
 
 airflow variables import /opt/airflow/secrets/var.json
 ```
+
+## Create var.json file in secrets/
+
+```json
+{
+    "API_KEY": "YOUR_API_KEY_HERE"
+}
+```
